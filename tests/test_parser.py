@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+
+import pytest
+from pydantic import ValidationError
+
+from gesture_intent import IntentParser, IntentParserInput, IntentStateManager
+from gesture_intent.extractors import OpenAICompatibleExtractor
+from gesture_intent.models import (
+    EditingIntent,
+    IntentPatch,
+    ObjectAction,
+    ObjectRequirement,
+    ObjectType,
+    RequestType,
+    SemanticProjectObject,
+    SemanticProjectView,
+    model_dump,
+)
+from gesture_intent.store import IntentStore
+
+
+def parse(text: str, **kwargs):
+    return IntentParser().parse(IntentParserInput(user_utterance=text, **kwargs))
+
+
+def test_initial_request_separates_global_event_operation_and_constraint():
+    output = parse("把视频做成可爱的夏日海边风格，每次比心的时候出现粉色爱心，最后一个动作定格一秒，音乐欢快一点，爱心不要挡脸。")
+
+    assert output.request_type.value == "initial_edit"
+    assert output.editing_intent is not None
+    intent = output.editing_intent
+    assert "summer" in intent.global_intent.theme.tags
+    assert "beach" in intent.global_intent.theme.tags
+    assert intent.global_intent.style.tags == ["cute"]
+    assert any(item.object_type == ObjectType.music for item in intent.object_requirements)
+    assert intent.event_bound_requirements[0].trigger.event.canonical == "heart_gesture"
+    assert intent.event_bound_requirements[0].trigger.occurrence.type.value == "all"
+    assert intent.event_bound_requirements[0].requirement.semantic_description.raw == "粉色爱心"
+    assert intent.explicit_operations[0].operation.value == "freeze"
+    assert intent.explicit_operations[0].parameters["duration"]["value"] == 1.0
+    assert intent.constraints[0].type == "avoid_overlap"
+    assert any(query.type == "person_face_tracking" for query in output.required_video_queries)
+    assert all(item.source_text for item in intent.object_requirements + intent.event_bound_requirements + intent.explicit_operations + intent.constraints)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("第一次比心时出现爱心", "first"),
+        ("最后一次比心时出现爱心", "last"),
+        ("每次比心时出现爱心", "all"),
+        ("第二次比心时出现爱心", "index"),
+        ("第二次到第四次比心时出现爱心", "range"),
+    ],
+)
+def test_occurrence_forms(text: str, expected: str):
+    output = parse(text)
+    occurrence = output.editing_intent.event_bound_requirements[0].trigger.occurrence
+    assert occurrence.type.value == expected
+    if expected == "index":
+        assert occurrence.value == 2
+    if expected == "range":
+        assert (occurrence.start, occurrence.end) == (2, 4)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("比心之前出现爱心", "before_event"),
+        ("比心的时候出现爱心", "at_event"),
+        ("转身过程中添加旋转效果", "during_event"),
+        ("比心之后出现星星", "after_event"),
+    ],
+)
+def test_temporal_relations(text: str, expected: str):
+    output = parse(text)
+    assert output.editing_intent.event_bound_requirements[0].trigger.temporal_relation.value == expected
+
+
+def test_pose_and_audio_video_queries_are_targeted():
+    output = parse("手举到头顶时出现皇冠，音乐重拍的时候闪一下。")
+    query_types = {query.type for query in output.required_video_queries}
+    assert "pose_condition_detection" in query_types
+    assert "audio_event_detection" in query_types
+    assert all(query.type != "detect_all_gestures" for query in output.required_video_queries)
+
+
+def project_view() -> SemanticProjectView:
+    return SemanticProjectView(
+        objects=[
+            SemanticProjectObject(id="heart_01", object_type=ObjectType.sticker, description="粉色爱心", event_ref="heart_gesture", order=1),
+            SemanticProjectObject(id="heart_02", object_type=ObjectType.sticker, description="粉色爱心", event_ref="heart_gesture", order=2),
+            SemanticProjectObject(id="text_ending_01", object_type=ObjectType.text, description="Summer!", order=3),
+            SemanticProjectObject(id="music_01", object_type=ObjectType.music, description="summer pop", order=4),
+        ]
+    )
+
+
+def test_revision_resolves_object_references_and_reports_affected_objects():
+    current = parse("背景换成海边，每次比心时出现粉色爱心")
+    output = IntentParser().parse(
+        IntentParserInput(
+            user_utterance="第二个爱心小一点，最后那个文字改成 Hello Summer，音乐再小一点",
+            current_effective_intent=current.editing_intent,
+            semantic_project_view=project_view(),
+        )
+    )
+
+    assert output.request_type.value == "revision"
+    assert output.intent_patch is not None
+    assert {item.target_id for item in output.resolved_references} == {"heart_02", "text_ending_01", "music_01"}
+    assert set(output.affected_objects) == {"heart_02", "text_ending_01", "music_01"}
+    operations = output.intent_patch.add_operations
+    assert {item.operation.value for item in operations} == {"scale_adjust", "replace_text", "volume_adjust"}
+    text_op = next(item for item in operations if item.operation.value == "replace_text")
+    assert text_op.parameters["value"] == "Hello Summer"
+    assert not output.unresolved
+
+
+def test_ambiguous_reference_is_unresolved():
+    current = parse("每次比心时出现爱心")
+    output = IntentParser().parse(
+        IntentParserInput(
+            user_utterance="那个爱心小一点",
+            current_effective_intent=current.editing_intent,
+            semantic_project_view=project_view(),
+        )
+    )
+    assert len(output.unresolved) == 1
+    assert output.unresolved[0].candidates == ["heart_01", "heart_02"]
+    assert not output.affected_objects
+
+
+def test_patch_preserves_old_intent():
+    first = parse("背景换成海边")
+    second = parse("音乐换得欢快一点", current_effective_intent=first.editing_intent, semantic_project_view=SemanticProjectView(objects=[]))
+    assert second.intent_patch is not None
+    updated = IntentStateManager().apply_patch(first.editing_intent, second.intent_patch)
+    assert any(item.object_type == ObjectType.background for item in updated.object_requirements)
+    assert any(item.object_type == ObjectType.music for item in updated.object_requirements)
+
+
+def test_addition_event_patch_and_removal_patch_apply_to_state():
+    current = parse("每次比心时出现爱心")
+    addition = IntentParser().parse(
+        IntentParserInput(
+            user_utterance="转身过程中添加旋转效果",
+            current_effective_intent=current.editing_intent,
+            semantic_project_view=SemanticProjectView(objects=[]),
+        )
+    )
+    assert addition.intent_patch is not None
+    assert addition.intent_patch.add_event_bound_requirements
+    updated = IntentStateManager().apply_patch(current.editing_intent, addition.intent_patch)
+    assert any(item.trigger.event.canonical == "turn_body" for item in updated.event_bound_requirements)
+
+    removal = IntentParser().parse(
+        IntentParserInput(
+            user_utterance="最后那个爱心删掉",
+            current_effective_intent=updated,
+            semantic_project_view=project_view(),
+        )
+    )
+    assert removal.intent_patch is not None
+    assert removal.intent_patch.remove_object_requirement_ids == ["heart_02"]
+
+
+def test_global_revision_is_a_patch():
+    current = parse("背景换成海边")
+    output = parse("整体做成可爱风格", current_effective_intent=current.editing_intent)
+    assert output.intent_patch is not None
+    assert "style" in output.intent_patch.global_updates
+    updated = IntentStateManager().apply_patch(current.editing_intent, output.intent_patch)
+    assert updated.global_intent.style.tags == ["cute"]
+
+
+def test_conflict_detection():
+    output = parse("保持原视频长度，最后一个动作定格两秒，不要修改原来的音乐，音乐换成欢快音乐")
+    conflict_types = {item.type for item in output.conflicts}
+    assert "duration_conflict" in conflict_types
+    assert "original_music_conflict" in conflict_types
+
+
+def test_invalid_llm_result_falls_back_to_rules():
+    class BadExtractor:
+        def extract(self, input, request_type):
+            return {"editing_intent": {"confidence": 2}}
+
+    output = IntentParser(extractor=BadExtractor()).parse(IntentParserInput(user_utterance="每次比心时出现爱心"))
+    assert output.editing_intent is not None
+    assert output.parser_mode == "rules_fallback"
+    assert output.fallback_reason == "ValidationError"
+    assert output.editing_intent.event_bound_requirements[0].trigger.event.canonical == "heart_gesture"
+
+
+def test_openai_compatible_adapter_uses_standard_environment_and_json_mode(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": json.dumps({"event_bound_requirements": []})}}]}).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["authorization"] = req.get_header("Authorization")
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unit-test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "unit-test-model")
+    monkeypatch.delenv("INTENT_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("INTENT_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("INTENT_LLM_MODEL", raising=False)
+    monkeypatch.delenv("INTENT_LLM_RESPONSE_FORMAT", raising=False)
+    monkeypatch.setattr("gesture_intent.extractors.request.urlopen", fake_urlopen)
+
+    adapter = OpenAICompatibleExtractor.from_environment()
+    assert adapter is not None
+    result = adapter.extract(IntentParserInput(user_utterance="测试"), RequestType.initial_edit)
+
+    assert result == {"event_bound_requirements": []}
+    assert captured["url"] == "https://models.sjtu.edu.cn/api/v1/chat/completions"
+    assert captured["authorization"] == "Bearer unit-test-key"
+    assert captured["payload"]["model"] == "unit-test-model"
+    assert captured["payload"]["response_format"] == {"type": "json_object"}
+
+
+def test_openai_compatible_adapter_can_request_json_schema(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"{\\"event_bound_requirements\\":[]}"}}]}'
+
+    def fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setenv("INTENT_LLM_API_KEY", "unit-test-key")
+    monkeypatch.setenv("INTENT_LLM_RESPONSE_FORMAT", "json_schema")
+    monkeypatch.setattr("gesture_intent.extractors.request.urlopen", fake_urlopen)
+    adapter = OpenAICompatibleExtractor.from_environment()
+    assert adapter is not None
+    adapter.extract(IntentParserInput(user_utterance="测试"), RequestType.initial_edit)
+    response_format = captured["payload"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"]["title"] == "EditingIntent"
+
+
+def test_deepseek_reasoner_payload_omits_temperature_and_accepts_fenced_json(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            content = "```json\n{\"event_bound_requirements\": []}\n```"
+            return json.dumps({"choices": [{"message": {"content": content}}]}).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setenv("INTENT_LLM_API_KEY", "unit-test-key")
+    monkeypatch.setenv("INTENT_LLM_BASE_URL", "https://models.sjtu.edu.cn/api/v1")
+    monkeypatch.setenv("INTENT_LLM_MODEL", "deepseek-reasoner")
+    monkeypatch.delenv("INTENT_LLM_RESPONSE_FORMAT", raising=False)
+    monkeypatch.setattr("gesture_intent.extractors.request.urlopen", fake_urlopen)
+
+    adapter = OpenAICompatibleExtractor.from_environment()
+    assert adapter is not None
+    result = adapter.extract(IntentParserInput(user_utterance="测试"), RequestType.initial_edit)
+    assert result == {"event_bound_requirements": []}
+    assert "temperature" not in captured["payload"]
+
+
+def test_schema_rejects_invalid_confidence():
+    with pytest.raises(ValidationError):
+        IntentParserInput(
+            user_utterance="测试",
+            current_effective_intent=EditingIntent(
+                object_requirements=[
+                    ObjectRequirement(
+                        id="bad",
+                        object_type=ObjectType.sticker,
+                        action=ObjectAction.add,
+                        source_text="测试",
+                        confidence=2,
+                    )
+                ]
+            ),
+        )
+
+
+def test_json_store_round_trip(tmp_path):
+    output = parse("背景换成海边")
+    store = IntentStore(tmp_path)
+    store.save_state(output.editing_intent, utterances=["背景换成海边"], version=2)
+    store.append_history("背景换成海边", output)
+    restored = store.load_current_intent()
+    assert model_dump(restored) == model_dump(output.editing_intent)
+    assert len(store.load_history()) == 1
+    state = store.load_state()
+    assert state["version"] == 2
+    assert state["requirement_ids"]
+
+
+def test_cli_json_round_trip(tmp_path):
+    input_path = tmp_path / "request.json"
+    input_path.write_text(json.dumps({"user_utterance": "每次比心时出现粉色爱心"}, ensure_ascii=False), encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, "-m", "gesture_intent", "parse", "--input", str(input_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={**__import__("os").environ, "PYTHONPATH": "src"},
+        check=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["request_type"] == "initial_edit"
+    assert result["editing_intent"]["event_bound_requirements"][0]["trigger"]["event"]["canonical"] == "heart_gesture"
