@@ -112,7 +112,12 @@ def conflicts(intent: Optional[EditingIntent] = None, patch: Optional[IntentPatc
 
     preserve_music = next((item for item in constraints if item.type == "preserve_original_music"), None)
     changed_music = next((item for item in object_requirements if item.object_type == ObjectType.music and item.action in {ObjectAction.replace, ObjectAction.remove}), None)
-    changed_music_operation = next((item for item in operations if (item.target.value in {"current music", "original_music"} or item.operation == OperationType.volume_adjust) and item.operation in {OperationType.replace_asset, OperationType.remove, OperationType.volume_adjust}), None)
+    # Only replacing or removing a music track counts as "changing" it; a
+    # volume_adjust merely changes loudness and must not be treated as editing
+    # the original music. Accept either the reserved phrases or a resolved
+    # music object_id (after resolve_references rewrites the target).
+    music_ids = {item.id for item in object_requirements if item.object_type == ObjectType.music}
+    changed_music_operation = next((item for item in operations if item.target.value in ({"current music", "original_music"} | music_ids) and item.operation in {OperationType.replace_asset, OperationType.remove}), None)
     if preserve_music and (changed_music or changed_music_operation):
         other = changed_music or changed_music_operation
         result.append(Conflict(requirements=[preserve_music.id, other.id], type="original_music_conflict", severity="high", source_texts=[preserve_music.raw, other.source_text]))

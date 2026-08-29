@@ -10,16 +10,26 @@ from pydantic import ValidationError
 from gesture_intent import IntentParser, IntentParserInput, IntentStateManager
 from gesture_intent.extractors import OpenAICompatibleExtractor
 from gesture_intent.models import (
+    Constraint,
     EditingIntent,
+    EventBoundRequirement,
+    EventReference,
+    EventRequirement,
+    EventTrigger,
+    ExplicitOperation,
     IntentPatch,
     ObjectAction,
     ObjectRequirement,
     ObjectType,
+    OperationType,
     RequestType,
     SemanticProjectObject,
     SemanticProjectView,
+    SemanticValue,
+    TargetReference,
     model_dump,
 )
+from gesture_intent.checks import conflicts
 from gesture_intent.store import IntentStore
 
 
@@ -341,3 +351,71 @@ def test_cli_json_round_trip(tmp_path):
     result = json.loads(completed.stdout)
     assert result["request_type"] == "initial_edit"
     assert result["editing_intent"]["event_bound_requirements"][0]["trigger"]["event"]["canonical"] == "heart_gesture"
+
+
+def test_revision_delete_explicit_operation_applied():
+    current = EditingIntent()
+    current.explicit_operations.append(
+        ExplicitOperation(
+            id="operation_01",
+            operation=OperationType.scale_adjust,
+            target=TargetReference(type="object_reference", value="爱心"),
+            parameters={"direction": "larger"},
+            source_text="把爱心放大",
+        )
+    )
+    output = parse("把那个爱心效果删掉", current_effective_intent=current)
+    patch = output.intent_patch
+    assert patch is not None
+    assert "operation_01" in patch.remove_operation_ids
+    updated = IntentStateManager().apply_patch(current, patch)
+    assert all(op.id != "operation_01" for op in updated.explicit_operations)
+
+
+def test_revision_delete_event_bound_requirement_applied():
+    current = EditingIntent()
+    current.event_bound_requirements.append(
+        EventBoundRequirement(
+            id="event_req_01",
+            source_text="比心出现爱心",
+            trigger=EventTrigger(event=EventReference(type="gesture", raw="比心", canonical="heart_gesture")),
+            requirement=EventRequirement(object_type=ObjectType.sticker, action=ObjectAction.add, semantic_description=SemanticValue(raw="爱心")),
+        )
+    )
+    output = parse("删掉那个比心特效", current_effective_intent=current)
+    patch = output.intent_patch
+    assert patch is not None
+    assert "event_req_01" in patch.remove_event_bound_requirement_ids
+    updated = IntentStateManager().apply_patch(current, patch)
+    assert all(req.id != "event_req_01" for req in updated.event_bound_requirements)
+
+
+def test_volume_adjust_does_not_trigger_original_music_conflict():
+    output = parse("音乐调低一点，不要修改原来的音乐", current_effective_intent=EditingIntent())
+    assert "original_music_conflict" not in [c.type for c in output.conflicts]
+
+
+def test_music_replace_still_conflicts_after_resolution_to_object_id():
+    current = EditingIntent()
+    current.object_requirements.append(
+        ObjectRequirement(
+            id="req_music_01",
+            object_type=ObjectType.music,
+            action=ObjectAction.replace,
+            description=SemanticValue(raw="欢快音乐", tags=["cheerful"]),
+            source_text="换成欢快音乐",
+        )
+    )
+    patch = IntentPatch(
+        add_operations=[
+            ExplicitOperation(
+                id="op_01",
+                operation=OperationType.replace_asset,
+                target=TargetReference(type="object_id", value="req_music_01"),
+                parameters={},
+                source_text="换个音乐",
+            )
+        ],
+        add_constraints=[Constraint(id="c_01", scope={}, type="preserve_original_music", raw="保留原曲")],
+    )
+    assert any(c.type == "original_music_conflict" for c in conflicts(patch=patch, intent=current))
