@@ -63,7 +63,10 @@ class IntentParser:
             resolved_references=resolution.resolved or [],
             required_video_queries=required_video_queries(patch=patch),
             affected_objects=patch.affected_objects,
-            conflicts=conflicts(patch=patch),
+            # Pass the current intent so conflict checks can still map a
+            # reference that resolve_references rewrote to an object_id (e.g. a
+            # music target) back to its semantic type.
+            conflicts=conflicts(patch=patch, intent=parsed_input.current_effective_intent),
             unresolved=unresolved,
             confidence=_confidence_summary(patch=patch),
         )

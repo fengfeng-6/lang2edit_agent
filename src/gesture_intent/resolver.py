@@ -59,6 +59,7 @@ def resolve_references(input: IntentParserInput, *, intent: Optional[EditingInte
 
     retained_add_operations = []
     retained_update_operations = []
+    current_intent = input.current_effective_intent
     for operation in patch.add_operations + patch.update_operations:
         operation_target, reference = _resolve_target(operation.target, objects)
         if reference:
@@ -71,6 +72,20 @@ def resolve_references(input: IntentParserInput, *, intent: Optional[EditingInte
                     patch.remove_object_requirement_ids.append(target_id)
                     continue
             else:
+                # A remove target that did not resolve to an object requirement
+                # may instead refer to an existing explicit operation or an
+                # event-bound requirement. Route it to the matching removal list
+                # so the delete is not a silent no-op.
+                if operation.operation.value == "remove" and current_intent is not None:
+                    matched = _match_removable_target(operation.target.value, current_intent)
+                    if matched is not None:
+                        kind, removal_id = matched
+                        affected.append(removal_id)
+                        if kind == "operation":
+                            patch.remove_operation_ids.append(removal_id)
+                        else:
+                            patch.remove_event_bound_requirement_ids.append(removal_id)
+                        continue
                 unresolved.append(reference)  # type: ignore[arg-type]
         if operation in patch.add_operations:
             retained_add_operations.append(operation)
@@ -78,6 +93,8 @@ def resolve_references(input: IntentParserInput, *, intent: Optional[EditingInte
             retained_update_operations.append(operation)
     patch.add_operations = retained_add_operations
     patch.update_operations = retained_update_operations
+    patch.remove_operation_ids = _unique(patch.remove_operation_ids)
+    patch.remove_event_bound_requirement_ids = _unique(patch.remove_event_bound_requirement_ids)
 
     remove_ids: list[str] = []
     for raw_target in patch.remove_object_requirement_ids:
@@ -126,6 +143,40 @@ def _resolve_raw_target(raw: str, objects: list[SemanticProjectObject]):
         chosen = candidates[0]
         return TargetReference(type="object_id", value=chosen.id), ResolvedReference(type="object_reference", raw=raw, target_id=chosen.id, confidence=0.96)
     return TargetReference(type="object_reference", value=raw), UnresolvedReference(type="object_reference", raw=raw, candidates=[item.id for item in candidates], confidence=0.42, reason="multiple matching project objects")
+
+
+_REMOVAL_KEYWORDS = ("爱心", "星星", "闪光", "效果", "文字", "文案", "背景", "音乐", "贴纸", "比心", "皇冠", "海星", "放大", "缩小", "定格", "音量")
+
+
+def _removal_tokens(text: str) -> set[str]:
+    """Collect the domain keywords present in a phrase, used to match a remove
+    target back to an existing operation or event-bound requirement."""
+    return {keyword for keyword in _REMOVAL_KEYWORDS if keyword in text}
+
+
+def _match_removable_target(raw: str, intent: EditingIntent) -> Optional[tuple[str, str]]:
+    """Match a remove target phrase against the current intent's explicit
+    operations and event-bound requirements.
+
+    Returns ``(kind, id)`` where kind is ``"operation"`` or ``"event"``, or
+    ``None`` when there is no confident match. Used when a remove operation's
+    target could not be resolved to an object requirement.
+    """
+    target_tokens = _removal_tokens(raw)
+    if not target_tokens:
+        return None
+    for operation in intent.explicit_operations:
+        haystack = " ".join([operation.target.value, operation.source_text, operation.operation.value])
+        if _removal_tokens(haystack) & target_tokens:
+            return ("operation", operation.id)
+    for requirement in intent.event_bound_requirements:
+        event = requirement.trigger.event
+        description = requirement.requirement.semantic_description.raw if requirement.requirement.semantic_description else ""
+        operation = requirement.requirement.operation.value if requirement.requirement.operation else ""
+        haystack = " ".join([event.raw, event.canonical or "", description, requirement.source_text, operation])
+        if _removal_tokens(haystack) & target_tokens:
+            return ("event", requirement.id)
+    return None
 
 
 _REFERENCE_KEYWORD_TOKENS = {
