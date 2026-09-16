@@ -11,9 +11,13 @@ from typing import Any, Dict, Optional, Protocol
 from urllib import error, request
 
 from .canonicalizer import (
+    EVENT_ACTION_WORDS,
     canonicalize_gesture,
+    contains_event_trigger,
     event_from_text,
     first_match,
+    inside_spans,
+    quoted_spans,
     semantic_value,
     split_clauses,
     tags_for,
@@ -247,7 +251,7 @@ class RuleBasedExtractor:
     def _parse_event_requirement(self, clause: str, allocator: IdAllocator) -> Optional[EventBoundRequirement]:
         if not _contains_event(clause):
             return None
-        has_action = any(word in clause for word in ("出现", "弹出", "跳出来", "添加", "加一个", "加上", "闪一下", "显示"))
+        has_action = any(word in clause for word in EVENT_ACTION_WORDS)
         if not has_action:
             return None
         event_type, canonical, condition, event_confidence = event_from_text(clause)
@@ -456,7 +460,7 @@ def _model_schema(model_type: Any) -> dict[str, Any]:
 
 
 def _contains_event(text: str) -> bool:
-    return bool(canonicalize_gesture(text) or any(word in text for word in ("转身", "蹲下", "跳跃", "最后一个动作", "最后动作", "结束动作", "手举到头顶", "双手交叉", "音乐重拍", "重拍", "鼓点")))
+    return contains_event_trigger(text)
 
 
 def _parse_occurrence(text: str) -> Occurrence:
@@ -560,7 +564,12 @@ def _parse_text_object(clause: str, allocator: IdAllocator) -> Optional[ObjectRe
 
 
 def _clean_description(value: str) -> str:
-    value = re.split(r"(?:，|。|；|但是|但不要|并且不要|不要)", value, maxsplit=1)[0]
+    spans = quoted_spans(value)
+    for match in re.finditer(r"(?:，|。|；|但是|但不要|并且不要|不要)", value):
+        if inside_spans(match.start(), spans):
+            continue
+        value = value[: match.start()]
+        break
     return value.strip(" \t,，。；;:：\"“”'") or value.strip()
 
 
@@ -573,7 +582,7 @@ def _music_description(clause: str) -> str:
 
 
 def _text_content(description: str) -> str:
-    return description.replace("文字", "").replace("文案", "").strip()
+    return description.replace("文字", "").replace("文案", "").strip().strip("“”\"'「」『』《》 ")
 
 
 def _reference_phrase(text: str) -> str:

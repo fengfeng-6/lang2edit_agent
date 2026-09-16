@@ -341,3 +341,128 @@ def test_cli_json_round_trip(tmp_path):
     result = json.loads(completed.stdout)
     assert result["request_type"] == "initial_edit"
     assert result["editing_intent"]["event_bound_requirements"][0]["trigger"]["event"]["canonical"] == "heart_gesture"
+
+
+@pytest.mark.parametrize(
+    ("text", "canonical", "occurrence"),
+    [
+        ("每次比心的时候，出现粉色爱心", "heart_gesture", "all"),
+        ("每次比心时，出现粉色爱心", "heart_gesture", "all"),
+        ("每次比心的时候。出现粉色爱心", "heart_gesture", "all"),
+        ("每次比心的时候，屏幕上出现粉色爱心", "heart_gesture", "all"),
+        ("第二次比心，出现爱心", "heart_gesture", "index"),
+        ("每次挥手，加一个爱心", "wave_hand", "all"),
+        ("每次点赞的时候，弹出星星", "thumbs_up", "all"),
+        ("手举到头顶的时候，出现皇冠", None, "all"),
+        ("音乐重拍的时候，闪一下", "downbeat", "all"),
+        ("音乐开始的时候，出现爱心", "music_onset", "all"),
+    ],
+)
+def test_trigger_and_requirement_split_by_punctuation(text, canonical, occurrence):
+    """A comma/period between trigger and requirement must not drop the binding."""
+    output = parse(text)
+    requirements = output.editing_intent.event_bound_requirements
+    assert len(requirements) == 1
+    trigger = requirements[0].trigger
+    assert trigger.event.canonical == canonical
+    assert trigger.occurrence.type.value == occurrence
+    assert requirements[0].requirement.semantic_description.raw
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("比心之前，出现星星", "before_event"),
+        ("转身过程中，添加旋转效果", "during_event"),
+        ("比心之后，出现星星", "after_event"),
+        ("每次比心的时候，出现爱心", "at_event"),
+    ],
+)
+def test_temporal_relation_across_punctuation(text, expected):
+    output = parse(text)
+    assert output.editing_intent.event_bound_requirements[0].trigger.temporal_relation.value == expected
+
+
+def test_constraint_clause_between_trigger_and_requirement_still_binds():
+    output = parse("每次比心的时候，不要挡脸，出现爱心")
+    intent = output.editing_intent
+    assert intent.event_bound_requirements[0].trigger.event.canonical == "heart_gesture"
+    assert intent.event_bound_requirements[0].requirement.semantic_description.raw == "爱心"
+    assert any(item.type == "avoid_overlap" for item in intent.constraints)
+
+
+def test_following_independent_requirement_is_not_absorbed():
+    output = parse("每次比心的时候，出现粉色爱心，音乐欢快一点")
+    intent = output.editing_intent
+    assert intent.event_bound_requirements[0].trigger.event.canonical == "heart_gesture"
+    assert intent.event_bound_requirements[0].requirement.semantic_description.raw == "粉色爱心"
+    assert any(item.object_type == ObjectType.music for item in intent.object_requirements)
+
+
+def test_complete_following_event_clause_keeps_its_own_trigger():
+    output = parse("每次挥手的时候，每次比心时出现爱心")
+    requirements = output.editing_intent.event_bound_requirements
+    assert len(requirements) == 1
+    assert requirements[0].trigger.event.canonical == "heart_gesture"
+
+
+def test_event_word_as_object_does_not_absorb_next_clause():
+    output = parse("想做爱心，加一个星星")
+    intent = output.editing_intent
+    assert not intent.event_bound_requirements
+    assert any(
+        item.object_type == ObjectType.sticker and item.description.raw == "星星"
+        for item in intent.object_requirements
+    )
+
+
+def test_lone_trigger_without_requirement_produces_nothing():
+    output = parse("每次比心的时候")
+    assert not output.editing_intent.event_bound_requirements
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '最后加一段文字"你好，世界"',
+        "最后加一段文字“你好，世界”",
+        "加一段文字：'Hello, World'",
+        "加一段文字「你好，世界」",
+    ],
+)
+def test_quoted_text_keeps_inner_punctuation(text):
+    output = parse(text)
+    text_requirements = [
+        item for item in output.editing_intent.object_requirements if item.object_type == ObjectType.text
+    ]
+    assert len(text_requirements) == 1
+    assert "，" in text_requirements[0].content or "," in text_requirements[0].content
+
+
+def test_patch_path_merges_trigger_clauses_too():
+    current = parse("背景换成海边")
+    output = IntentParser().parse(
+        IntentParserInput(
+            user_utterance="每次挥手的时候，加一个星星",
+            current_effective_intent=current.editing_intent,
+        )
+    )
+    assert output.intent_patch is not None
+    additions = output.intent_patch.add_event_bound_requirements
+    assert len(additions) == 1
+    assert additions[0].trigger.event.canonical == "wave_hand"
+
+
+def test_event_bound_audio_and_pose_queries_across_comma():
+    output = parse("手举到头顶的时候，出现皇冠，音乐重拍的时候，闪一下。")
+    query_types = {query.type for query in output.required_video_queries}
+    assert "pose_condition_detection" in query_types
+    assert "audio_event_detection" in query_types
+
+
+def test_event_bound_quoted_text_keeps_inner_punctuation():
+    output = parse('每次比心的时候，出现文字"你好，世界"')
+    requirement = output.editing_intent.event_bound_requirements[0]
+    assert requirement.trigger.event.canonical == "heart_gesture"
+    assert requirement.requirement.object_type == ObjectType.text
+    assert requirement.requirement.content == "你好，世界"

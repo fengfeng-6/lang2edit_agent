@@ -162,15 +162,143 @@ def normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_CLAUSE_SEPARATORS = frozenset("，。；;！？!?\n")
+
+_QUOTE_CLOSERS = {
+    '"': '"',
+    "“": "”",
+    "'": "'",
+    "‘": "’",
+    "「": "」",
+    "『": "』",
+    "《": "》",
+}
+
+# Action words marking that a clause carries a requirement, not just a trigger.
+EVENT_ACTION_WORDS = ("出现", "弹出", "跳出来", "添加", "加一个", "加上", "闪一下", "显示")
+
+# A clause ending in one of these is an event trigger whose requirement lives
+# in the next clause ("每次比心的时候，出现爱心" must stay one clause).
+_TRIGGER_ENDINGS = (
+    "的时候",
+    "之前",
+    "以前",
+    "之后",
+    "以后",
+    "过程中",
+    "全程",
+    "开始",
+    "结束",
+    "时",
+    "前",
+    "后",
+)
+
+_EVENT_SOURCES = tuple(GESTURE_SYNONYMS) + tuple(BODY_SYNONYMS) + tuple(AUDIO_SYNONYMS)
+
+# Words showing a clause already carries a requirement (event-bound action or
+# explicit operation), so it is not a lone trigger waiting for the next clause.
+_REQUIREMENT_WORDS = EVENT_ACTION_WORDS + (
+    "定格", "剪掉", "删掉", "删除", "去掉", "移除",
+    "缩小", "放大", "调低", "调小", "调大", "降低",
+    "加快", "减慢", "替换", "换成", "改成", "换掉",
+    "放上", "贴上",
+)
+
+# Bare trigger clauses like "每次比心" / "第二次比心" open a merge only when
+# they start with a quantifier/temporal prefix; otherwise the trailing event
+# word is more likely the object of a verb ("想做爱心" must not absorb "加星星").
+_TRIGGER_PREFIXES = ("每", "第", "当", "从", "在", "到", "等")
+
+
+def contains_event_trigger(text: str) -> bool:
+    """Whether the text mentions a detectable event trigger."""
+    return bool(
+        canonicalize_gesture(text)
+        or canonicalize_body_action(text)
+        or canonicalize_audio_event(text)
+        or "手举到头顶" in text
+        or "双手交叉" in text
+    )
+
+
 def split_clauses(text: str) -> list[str]:
-    """Split Chinese requests without splitting quoted text."""
-    parts = re.split(r"[，。；;！？!?\n]+", text)
-    result: list[str] = []
-    for part in parts:
+    """Split a request into clauses without breaking quotes or trigger pairs.
+
+    Separators inside quoted spans ("..." 「...」 etc.) do not split, so quoted
+    payloads like 文字："你好，世界" stay intact.  A clause that ends with an
+    event trigger ("每次比心的时候" / "第二次比心") absorbs the next clause so
+    the requirement stays attached to its trigger — unless the next clause is
+    itself a complete event clause (trigger + action), which keeps its own
+    trigger.
+    """
+    spans = quoted_spans(text)
+    raw_parts: list[str] = []
+    buffer: list[str] = []
+    for index, char in enumerate(text):
+        if char in _CLAUSE_SEPARATORS and not inside_spans(index, spans):
+            raw_parts.append("".join(buffer))
+            buffer = []
+        else:
+            buffer.append(char)
+    raw_parts.append("".join(buffer))
+
+    clauses: list[str] = []
+    for part in raw_parts:
         part = normalize_spaces(part)
-        if part:
-            result.append(part)
-    return result
+        if not part:
+            continue
+        if clauses and _needs_following_clause(clauses[-1]) and not _is_complete_event_clause(part):
+            clauses[-1] += part
+        else:
+            clauses.append(part)
+    return clauses
+
+
+def quoted_spans(text: str) -> list[tuple[int, int]]:
+    """Return (start, end) index spans covered by quote pairs."""
+    spans: list[tuple[int, int]] = []
+    start: Optional[int] = None
+    closing: Optional[str] = None
+    for index, char in enumerate(text):
+        if closing is not None:
+            if char == closing:
+                spans.append((start, index + 1))
+                start = None
+                closing = None
+            continue
+        if char in _QUOTE_CLOSERS and not _is_apostrophe(text, index):
+            start = index
+            closing = _QUOTE_CLOSERS[char]
+    return spans
+
+
+def inside_spans(index: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start < index < end - 1 for start, end in spans)
+
+
+def _is_apostrophe(text: str, index: int) -> bool:
+    """An ASCII ' between two letters is an apostrophe (don't), not a quote."""
+    return (
+        text[index] == "'"
+        and 0 < index < len(text) - 1
+        and text[index - 1].isalpha()
+        and text[index + 1].isalpha()
+    )
+
+
+def _needs_following_clause(clause: str) -> bool:
+    if any(word in clause for word in _REQUIREMENT_WORDS):
+        return False
+    if clause.endswith(_TRIGGER_ENDINGS):
+        return True
+    if not clause.startswith(_TRIGGER_PREFIXES):
+        return False
+    return clause.endswith(_EVENT_SOURCES) or contains_event_trigger(clause)
+
+
+def _is_complete_event_clause(clause: str) -> bool:
+    return contains_event_trigger(clause) and any(word in clause for word in _REQUIREMENT_WORDS)
 
 
 def first_match(text: str, patterns: Iterable[str]) -> Optional[re.Match[str]]:
