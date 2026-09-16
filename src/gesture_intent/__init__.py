@@ -1,5 +1,7 @@
 """Natural-language intent understanding for video editing agents."""
 
+__version__ = "0.1.0"
+
 from .models import (
     EditingIntent,
     IntentParserInput,

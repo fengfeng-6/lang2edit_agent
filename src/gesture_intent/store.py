@@ -61,7 +61,15 @@ class IntentStore:
     def load_history(self) -> list[dict[str, Any]]:
         if not self.history_path.exists():
             return []
-        return [json.loads(line) for line in self.history_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        records: list[dict[str, Any]] = []
+        for line in self.history_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # tolerate a torn trailing line after a crash
+        return records
 
 
 def _requirement_ids(intent: EditingIntent) -> list[str]:
