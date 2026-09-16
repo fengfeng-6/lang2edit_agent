@@ -26,8 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "parse":
         return 2
     try:
-        raw = _read_stdin() if args.input == "-" else Path(args.input).read_text(encoding="utf-8")
-        input_model = model_validate(IntentParserInput, json.loads(raw))
+        raw = _read_stdin() if args.input == "-" else Path(args.input).read_text(encoding="utf-8-sig")
+        input_model = model_validate(IntentParserInput, json.loads(raw.lstrip(chr(0xFEFF))))
         output = IntentParser().parse(input_model)
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8")

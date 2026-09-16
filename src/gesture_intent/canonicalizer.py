@@ -175,7 +175,7 @@ _QUOTE_CLOSERS = {
 }
 
 # Action words marking that a clause carries a requirement, not just a trigger.
-EVENT_ACTION_WORDS = ("出现", "弹出", "跳出来", "添加", "加一个", "加上", "闪一下", "显示")
+EVENT_ACTION_WORDS = ("出现", "弹出", "跳出来", "添加", "加一个", "加上", "加", "闪一下", "显示")
 
 # A clause ending in one of these is an event trigger whose requirement lives
 # in the next clause ("每次比心的时候，出现爱心" must stay one clause).

@@ -93,7 +93,6 @@ class RuleBasedExtractor:
         return {"request_type": request_type, "intent_patch": patch}
 
     def _parse_intent(self, text: str, allocator: IdAllocator) -> EditingIntent:
-        global_intent = self._parse_global(text)
         objects: list[ObjectRequirement] = []
         event_requirements: list[EventBoundRequirement] = []
         operations: list[ExplicitOperation] = []
@@ -116,6 +115,11 @@ class RuleBasedExtractor:
             operation = self._parse_explicit_operation(text, allocator)
             if operation:
                 operations.append(operation)
+
+        # Global intent only sees text not already captured by a specific
+        # requirement — "粉色爱心" describes the sticker, not the video's
+        # color palette.
+        global_intent = self._parse_global(_residual_global_text(text, objects, event_requirements))
 
         if global_intent.autonomy and global_intent.autonomy.default == ConstraintLevel.open:
             protected = [item.id for item in objects if item.constraint_level == ConstraintLevel.hard]
@@ -157,7 +161,7 @@ class RuleBasedExtractor:
 
         global_updates: dict[str, Any] = {}
         if any(marker in text for marker in ("整体", "风格", "做成", "画面")):
-            parsed_global = self._parse_global(text)
+            parsed_global = self._parse_global(_residual_global_text(text, objects, event_requirements))
             for field in ("theme", "mood", "style", "pacing", "color_preference", "platform_style", "autonomy"):
                 value = getattr(parsed_global, field)
                 if value is not None:
@@ -231,7 +235,7 @@ class RuleBasedExtractor:
             result.append(text_req)
 
         # Standalone additions such as “再加一点星星” are object requirements.
-        if not any(canonicalize_gesture(clause) for _ in [0]) and not _contains_event(clause):
+        if not canonicalize_gesture(clause) and not _contains_event(clause):
             match = re.search(r"(?:再|另外|还)?加(?:上|一点|一个|一些)?\s*(星星|闪光|贝壳|海星|椰子树|爱心|皇冠)(?:素材|贴纸)?", clause)
             if match:
                 raw = match.group(1)
@@ -261,8 +265,6 @@ class RuleBasedExtractor:
         object_type = _object_type_for_description(description, clause)
         action = ObjectAction.add
         operation = None
-        if object_type == ObjectType.effect and "闪" in clause:
-            operation = OperationType.replace_asset
         occurrence = _parse_occurrence(clause)
         temporal_relation = _parse_temporal_relation(clause)
         event = EventReference(
@@ -467,7 +469,9 @@ def _parse_occurrence(text: str) -> Occurrence:
     number = r"[0-9一二两三四五六七八九十百]+"
     range_match = re.search(rf"第\s*({number})\s*次\s*(?:到|至|—|-)\s*(?:第\s*)?({number})\s*次", text)
     if range_match:
-        return Occurrence(type=OccurrenceType.range, start=_number_from_text(range_match.group(1)), end=_number_from_text(range_match.group(2)))
+        start, end = _number_from_text(range_match.group(1)), _number_from_text(range_match.group(2))
+        if start >= 1 and end >= 1:
+            return Occurrence(type=OccurrenceType.range, start=start, end=end)
     if "每次" in text:
         return Occurrence(type=OccurrenceType.all)
     if "第一次" in text:
@@ -476,7 +480,9 @@ def _parse_occurrence(text: str) -> Occurrence:
         return Occurrence(type=OccurrenceType.last)
     index_match = re.search(rf"第\s*({number})\s*次", text)
     if index_match:
-        return Occurrence(type=OccurrenceType.index, value=_number_from_text(index_match.group(1)))
+        value = _number_from_text(index_match.group(1))
+        if value >= 1:
+            return Occurrence(type=OccurrenceType.index, value=value)
     return Occurrence(type=OccurrenceType.all)
 
 
@@ -507,8 +513,8 @@ def _event_raw(text: str) -> str:
 
 def _event_asset_description(text: str) -> str:
     patterns = [
-        r"(?:出现|弹出|跳出来|添加|加一个|加上|显示|闪一下)\s*(?:一个|一只|一些|一点)?\s*(.+)$",
-        r"(?:的时候|时|过程中)\s*(?:出现|弹出|跳出来|添加|加上|闪一下)\s*(?:一个|一只|一些|一点)?\s*(.+)$",
+        r"(?:出现|弹出|跳出来|添加|加一个|加上|加|显示|闪一下)\s*(?:一个|一只|一些|一点)?\s*(.+)$",
+        r"(?:的时候|时|过程中)\s*(?:出现|弹出|跳出来|添加|加上|加|闪一下)\s*(?:一个|一只|一些|一点)?\s*(.+)$",
     ]
     match = first_match(text, patterns)
     if match:
@@ -579,6 +585,32 @@ def _music_description(clause: str) -> str:
         return _clean_description(match.group(1).replace("一点", "").strip())
     match = re.search(r"(?:加一首|添加一首|换一首|找一首)\s*(.+)$", clause)
     return _clean_description(match.group(1)) if match else "用户指定的音乐"
+
+
+def _residual_global_text(text: str, objects: list[ObjectRequirement], event_requirements: list[EventBoundRequirement]) -> str:
+    """Text minus phrases already captured by specific requirements.
+
+    Global intent fields should only see wording aimed at the whole video;
+    e.g. in "每次比心时出现蓝色爱心" the 蓝色 belongs to the sticker and must
+    not leak into ``global_intent.color_preference``.
+    """
+    phrases: list[str] = []
+    for item in objects:
+        if item.description:
+            phrases.append(item.description.raw)
+        if item.content:
+            phrases.append(item.content)
+    for item in event_requirements:
+        description = item.requirement.semantic_description
+        if description:
+            phrases.append(description.raw)
+        if item.requirement.content:
+            phrases.append(item.requirement.content)
+    residual = text
+    for phrase in phrases:
+        if phrase:
+            residual = residual.replace(phrase, "", 1)
+    return residual
 
 
 def _text_content(description: str) -> str:

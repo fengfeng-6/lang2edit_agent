@@ -82,7 +82,7 @@ def required_video_queries(intent: Optional[EditingIntent] = None, patch: Option
     return list(unique.values())
 
 
-def conflicts(intent: Optional[EditingIntent] = None, patch: Optional[IntentPatch] = None) -> list[Conflict]:
+def conflicts(intent: Optional[EditingIntent] = None, patch: Optional[IntentPatch] = None, object_types: Optional[dict[str, str]] = None) -> list[Conflict]:
     result: list[Conflict] = []
     constraints = intent.constraints if intent else []
     operations = intent.explicit_operations if intent else []
@@ -115,12 +115,23 @@ def conflicts(intent: Optional[EditingIntent] = None, patch: Optional[IntentPatc
     # Only replacing or removing a music track counts as "changing" it; a
     # volume_adjust merely changes loudness and must not be treated as editing
     # the original music. Accept either the reserved phrases or a resolved
-    # music object_id (after resolve_references rewrites the target).
+    # music object_id (after resolve_references rewrites the target) — the id
+    # may be a requirement id from the current intent or a project-view object
+    # id, so check both namespaces via object_types.
     music_ids = {item.id for item in object_requirements if item.object_type == ObjectType.music}
+    music_ids |= {object_id for object_id, kind in (object_types or {}).items() if kind == ObjectType.music.value}
     changed_music_operation = next((item for item in operations if item.target.value in ({"current music", "original_music"} | music_ids) and item.operation in {OperationType.replace_asset, OperationType.remove}), None)
-    if preserve_music and (changed_music or changed_music_operation):
+    # A resolved remove op is consumed into the patch's remove lists and no
+    # longer appears under operations — check those ids for music too.
+    removed_music = None
+    if patch:
+        removed_ids = patch.remove_object_requirement_ids + patch.remove_event_bound_requirement_ids + patch.remove_operation_ids
+        removed_music = next((rid for rid in removed_ids if rid in music_ids), None)
+    if preserve_music and (changed_music or changed_music_operation or removed_music):
         other = changed_music or changed_music_operation
-        result.append(Conflict(requirements=[preserve_music.id, other.id], type="original_music_conflict", severity="high", source_texts=[preserve_music.raw, other.source_text]))
+        other_id = other.id if other else removed_music
+        source_texts = [preserve_music.raw, other.source_text] if other else [preserve_music.raw]
+        result.append(Conflict(requirements=[preserve_music.id, other_id], type="original_music_conflict", severity="high", source_texts=source_texts))
 
     prohibit_text = next((item for item in constraints if item.type == "prohibit_object" and item.reference == "text"), None)
     added_text = next((item for item in object_requirements if item.object_type == ObjectType.text and item.action in {ObjectAction.add, ObjectAction.replace}), None)

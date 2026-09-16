@@ -203,7 +203,7 @@ def test_invalid_llm_result_falls_back_to_rules():
     output = IntentParser(extractor=BadExtractor()).parse(IntentParserInput(user_utterance="每次比心时出现爱心"))
     assert output.editing_intent is not None
     assert output.parser_mode == "rules_fallback"
-    assert output.fallback_reason == "ValidationError"
+    assert output.fallback_reason.startswith("ValidationError")
     assert output.editing_intent.event_bound_requirements[0].trigger.event.canonical == "heart_gesture"
 
 
@@ -544,3 +544,176 @@ def test_music_replace_still_conflicts_after_resolution_to_object_id():
         add_constraints=[Constraint(id="c_01", scope={}, type="preserve_original_music", raw="保留原曲")],
     )
     assert any(c.type == "original_music_conflict" for c in conflicts(patch=patch, intent=current))
+
+
+def test_remove_event_bound_object_via_project_view_id():
+    """把爱心删掉 with a project view: removes both the project object and the
+    backing event binding, so apply_patch actually drops it."""
+    current = parse("每次比心时出现粉色爱心")
+    event_req_id = current.editing_intent.event_bound_requirements[0].id
+    view = SemanticProjectView(
+        objects=[
+            SemanticProjectObject(id="heart_02", object_type=ObjectType.sticker, description="粉色爱心", event_ref="heart_gesture", order=2),
+        ]
+    )
+    output = IntentParser().parse(
+        IntentParserInput(
+            user_utterance="把爱心删掉",
+            current_effective_intent=current.editing_intent,
+            semantic_project_view=view,
+        )
+    )
+    patch = output.intent_patch
+    assert patch is not None
+    assert "heart_02" in patch.remove_object_requirement_ids
+    assert event_req_id in patch.remove_event_bound_requirement_ids
+    updated = IntentStateManager().apply_patch(current.editing_intent, patch)
+    assert not updated.event_bound_requirements
+
+
+def test_remove_ordinal_instance_keeps_the_binding():
+    """把第二个爱心删掉 removes that instance only — the binding stays."""
+    current = parse("每次比心时出现粉色爱心")
+    event_req_id = current.editing_intent.event_bound_requirements[0].id
+    view = SemanticProjectView(
+        objects=[
+            SemanticProjectObject(id="heart_01", object_type=ObjectType.sticker, description="粉色爱心", event_ref="heart_gesture", order=1),
+            SemanticProjectObject(id="heart_02", object_type=ObjectType.sticker, description="粉色爱心", event_ref="heart_gesture", order=2),
+        ]
+    )
+    output = IntentParser().parse(
+        IntentParserInput(
+            user_utterance="把第二个爱心删掉",
+            current_effective_intent=current.editing_intent,
+            semantic_project_view=view,
+        )
+    )
+    patch = output.intent_patch
+    assert patch.remove_object_requirement_ids == ["heart_02"]
+    assert event_req_id not in patch.remove_event_bound_requirement_ids
+    updated = IntentStateManager().apply_patch(current.editing_intent, patch)
+    assert updated.event_bound_requirements  # binding survives
+
+
+def test_remove_ambiguous_event_binding_is_unresolved():
+    """Two heart-producing bindings and no ordinal: report candidates instead
+    of silently picking one."""
+    current = parse("每次比心时出现爱心，每次挥手时出现爱心")
+    assert len(current.editing_intent.event_bound_requirements) == 2
+    output = parse("把爱心删掉", current_effective_intent=current.editing_intent)
+    patch = output.intent_patch
+    expected = {req.id for req in current.editing_intent.event_bound_requirements}
+    assert not patch.remove_event_bound_requirement_ids
+    assert not patch.remove_object_requirement_ids
+    assert len(output.unresolved) == 1
+    assert set(output.unresolved[0].candidates) == expected
+
+
+def test_remove_resolved_requirement_id_routes_directly():
+    """No project view: an event-bound requirement is itself addressable and
+    its id routes to remove_event_bound_requirement_ids."""
+    current = parse("每次比心时出现粉色爱心")
+    event_req_id = current.editing_intent.event_bound_requirements[0].id
+    output = parse("把那个爱心删掉", current_effective_intent=current.editing_intent)
+    patch = output.intent_patch
+    assert event_req_id in patch.remove_event_bound_requirement_ids
+    updated = IntentStateManager().apply_patch(current.editing_intent, patch)
+    assert not updated.event_bound_requirements
+
+
+def test_remove_music_conflict_after_resolution_to_view_object_id():
+    """preserve_original_music + 把音乐删掉 resolving to a view id still reports
+    the conflict."""
+    current = parse("背景换成海边")
+    view = SemanticProjectView(
+        objects=[SemanticProjectObject(id="music_01", object_type=ObjectType.music, description="summer pop", order=1)]
+    )
+    output = IntentParser().parse(
+        IntentParserInput(
+            user_utterance="不要修改原来的音乐，把音乐删掉",
+            current_effective_intent=current.editing_intent,
+            semantic_project_view=view,
+        )
+    )
+    assert "original_music_conflict" in {item.type for item in output.conflicts}
+
+
+def test_cross_turn_constraint_conflict():
+    """A constraint from turn 1 conflicts with an operation in turn 2."""
+    current = parse("不要修改原来的音乐")
+    output = parse("把音乐删掉", current_effective_intent=current.editing_intent)
+    assert "original_music_conflict" in {item.type for item in output.conflicts}
+
+
+def test_object_attribute_does_not_leak_into_global_intent():
+    output = parse("每次比心时出现蓝色爱心")
+    assert output.editing_intent.global_intent.color_preference is None
+
+    output = parse("背景换成海边")
+    intent = output.editing_intent
+    assert intent.global_intent.theme is None  # 海边修饰背景而非全局主题
+    assert any(item.object_type == ObjectType.background for item in intent.object_requirements)
+
+
+def test_global_intent_still_reads_unconsumed_words():
+    output = parse("每次比心时出现蓝色爱心，整体要粉色一点")
+    intent = output.editing_intent
+    assert intent.global_intent.color_preference is not None
+    assert intent.global_intent.color_preference.tags == ["pink"]
+
+
+def test_bare_jia_is_an_event_action_word():
+    output = parse("每次挥手时加爱心")
+    requirement = output.editing_intent.event_bound_requirements[0]
+    assert requirement.trigger.event.canonical == "wave_hand"
+    assert requirement.requirement.semantic_description.raw == "爱心"
+
+    output = parse("每次挥手时，加爱心")
+    requirement = output.editing_intent.event_bound_requirements[0]
+    assert requirement.trigger.event.canonical == "wave_hand"
+    assert requirement.requirement.semantic_description.raw == "爱心"
+
+
+def test_zeroth_occurrence_falls_back_to_all_without_crashing():
+    output = parse("第0次比心时出现爱心")
+    occurrence = output.editing_intent.event_bound_requirements[0].trigger.occurrence
+    assert occurrence.type.value == "all"
+
+
+def test_flash_effect_is_an_add_not_replace_asset():
+    output = parse("音乐重拍的时候闪一下")
+    requirement = output.editing_intent.event_bound_requirements[0]
+    assert requirement.requirement.object_type == ObjectType.effect
+    assert requirement.requirement.operation is None
+
+
+def test_custom_extractor_reports_custom_mode():
+    class CustomExtractor:
+        def extract(self, input, request_type):
+            return {"editing_intent": {}}
+
+    output = IntentParser(extractor=CustomExtractor()).parse(IntentParserInput(user_utterance="比心出现爱心"))
+    assert output.parser_mode == "custom"
+
+
+def test_cli_accepts_utf8_bom_file(tmp_path):
+    input_path = tmp_path / "bom.json"
+    input_path.write_bytes(b'\xef\xbb\xbf' + json.dumps({"user_utterance": "每次比心时出现爱心"}, ensure_ascii=False).encode("utf-8"))
+    completed = subprocess.run(
+        [sys.executable, "-m", "gesture_intent", "parse", "--input", str(input_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={**__import__("os").environ, "PYTHONPATH": "src"},
+        check=True,
+    )
+    assert json.loads(completed.stdout)["request_type"] == "initial_edit"
+
+
+def test_history_tolerates_a_torn_trailing_line(tmp_path):
+    output = parse("背景换成海边")
+    store = IntentStore(tmp_path)
+    store.append_history("背景换成海边", output)
+    with store.history_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"utterance": "半截写入')
+    assert len(store.load_history()) == 1

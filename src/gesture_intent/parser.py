@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import ValidationError
-
 from .checks import conflicts, normalized_semantics, required_video_queries
-from .extractors import RuleBasedExtractor, StructuredIntentExtractor, default_extractor
+from .extractors import OpenAICompatibleExtractor, RuleBasedExtractor, StructuredIntentExtractor, default_extractor
 from .models import (
     EditingIntent,
     IntentParserInput,
@@ -45,7 +43,7 @@ class IntentParser:
                 resolved_references=resolution.resolved or [],
                 required_video_queries=required_video_queries(intent=intent),
                 affected_objects=resolution.affected_objects or [],
-                conflicts=conflicts(intent=intent),
+                conflicts=conflicts(intent=intent, object_types=resolution.object_types),
                 unresolved=unresolved,
                 confidence=_confidence_summary(intent=intent),
             )
@@ -66,7 +64,7 @@ class IntentParser:
             # Pass the current intent so conflict checks can still map a
             # reference that resolve_references rewrote to an object_id (e.g. a
             # music target) back to its semantic type.
-            conflicts=conflicts(patch=patch, intent=parsed_input.current_effective_intent),
+            conflicts=conflicts(patch=patch, intent=parsed_input.current_effective_intent, object_types=resolution.object_types),
             unresolved=unresolved,
             confidence=_confidence_summary(patch=patch),
         )
@@ -78,16 +76,23 @@ class IntentParser:
             self._validate_extractor_shape(result, request_type)
             model_type = EditingIntent if request_type == RequestType.initial_edit else IntentPatch
             model_validate(model_type, result["editing_intent" if request_type == RequestType.initial_edit else "intent_patch"])
-            return result, "llm" if attempted_llm else "rules", None
-        except (Exception, ValidationError) as exc:
+            return result, self._extractor_mode(), None
+        except Exception as exc:
             # The deterministic extractor is deliberately the safe fallback:
             # it never invents assets or planner parameters. If the primary
             # extractor was already the deterministic one, re-running it cannot
             # help and would only raise the same error, so surface it directly.
-            fallback_reason = f"{type(exc).__name__}" if attempted_llm else None
+            fallback_reason = f"{type(exc).__name__}: {exc}" if attempted_llm else None
             if not attempted_llm:
                 raise
             return self.rule_fallback.extract(input, request_type), "rules_fallback", fallback_reason
+
+    def _extractor_mode(self) -> str:
+        if isinstance(self.extractor, RuleBasedExtractor):
+            return "rules"
+        if isinstance(self.extractor, OpenAICompatibleExtractor):
+            return "llm"
+        return "custom"
 
     @staticmethod
     def _validate_extractor_shape(result: Any, request_type: RequestType) -> None:
