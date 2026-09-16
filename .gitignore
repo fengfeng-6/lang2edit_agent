@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 state.json
 history.jsonl
+
+# 运行时产物与素材（视频、分析缓存、输出工程）不入库
+data/
+workspace/
