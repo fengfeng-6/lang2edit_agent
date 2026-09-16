@@ -154,10 +154,6 @@ class RuleBasedExtractor:
                 operations.append(operation)
 
         add_objects = [item for item in objects if item.action in {ObjectAction.add, ObjectAction.replace}]
-        remove_ids: list[str] = []
-        if any(item.action == ObjectAction.remove for item in objects):
-            remove_ids = [item.target_ref for item in objects if item.target_ref and item.action == ObjectAction.remove]
-            objects = [item for item in objects if item.action != ObjectAction.remove]
 
         global_updates: dict[str, Any] = {}
         if any(marker in text for marker in ("整体", "风格", "做成", "画面")):
@@ -172,7 +168,6 @@ class RuleBasedExtractor:
             add_event_bound_requirements=event_requirements,
             add_operations=operations,
             add_constraints=constraints,
-            remove_object_requirement_ids=remove_ids,
             global_updates=global_updates,
         )
 

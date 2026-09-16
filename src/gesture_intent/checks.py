@@ -55,6 +55,11 @@ def required_video_queries(intent: Optional[EditingIntent] = None, patch: Option
         event = requirement.trigger.event
         if event.type.value == "pose_condition":
             queries.append(RequiredVideoQuery(type="pose_condition_detection", condition=event.condition))
+        elif event.canonical is None:
+            # The event_from_text fallthrough can yield a video_structure event
+            # with no canonical name — an eventless detection query is useless
+            # to the video-understanding module, so skip it.
+            continue
         elif event.type.value == "audio_event":
             queries.append(RequiredVideoQuery(type="audio_event_detection", event=event.canonical, required_occurrence=requirement.trigger.occurrence))
         elif event.type.value == "video_structure":

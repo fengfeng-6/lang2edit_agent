@@ -426,9 +426,10 @@ def test_event_word_as_object_does_not_absorb_next_clause():
     )
 
 
-def test_lone_trigger_without_requirement_produces_nothing():
+def test_lone_trigger_without_requirement_flags_unparsed():
     output = parse("每次比心的时候")
     assert not output.editing_intent.event_bound_requirements
+    assert output.unresolved[0].type == "unparsed_utterance"
 
 
 @pytest.mark.parametrize(
@@ -717,3 +718,52 @@ def test_history_tolerates_a_torn_trailing_line(tmp_path):
     with store.history_path.open("a", encoding="utf-8") as handle:
         handle.write('{"utterance": "半截写入')
     assert len(store.load_history()) == 1
+
+
+def test_empty_parse_emits_unparsed_signal():
+    """An utterance with no extractable requirements must not silently pass."""
+    output = parse("今天天气不错")
+    intent = output.editing_intent
+    assert not intent.object_requirements
+    assert not intent.event_bound_requirements
+    assert len(output.unresolved) == 1
+    assert output.unresolved[0].type == "unparsed_utterance"
+    assert output.unresolved[0].reason
+
+
+def test_empty_patch_emits_unparsed_signal():
+    current = parse("背景换成海边")
+    output = IntentParser().parse(
+        IntentParserInput(
+            user_utterance="再想想吧",
+            current_effective_intent=current.editing_intent,
+        )
+    )
+    assert output.intent_patch is not None
+    assert output.unresolved[0].type == "unparsed_utterance"
+
+
+def test_unparsed_signal_not_emitted_when_something_extracted():
+    output = parse("不要挡脸")
+    assert output.editing_intent.constraints
+    assert not any(item.type == "unparsed_utterance" for item in output.unresolved)
+
+
+def test_eventless_video_structure_query_is_skipped():
+    """An event without canonical (e.g. from an LLM extractor) must not emit a
+    detection query — the video-understanding module cannot run it."""
+    from gesture_intent.checks import required_video_queries
+
+    intent = EditingIntent(
+        event_bound_requirements=[
+            EventBoundRequirement(
+                id="event_req_01",
+                source_text="双手交叉时闪一下",
+                trigger=EventTrigger(
+                    event=EventReference(type="video_structure", raw="双手交叉", canonical=None),
+                ),
+                requirement=EventRequirement(object_type=ObjectType.effect),
+            )
+        ]
+    )
+    assert all(query.type != "video_structure_detection" for query in required_video_queries(intent=intent))

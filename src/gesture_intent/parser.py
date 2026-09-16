@@ -12,6 +12,7 @@ from .models import (
     IntentParserOutput,
     IntentPatch,
     RequestType,
+    UnresolvedReference,
     model_validate,
 )
 from .resolver import resolve_references
@@ -34,6 +35,9 @@ class IntentParser:
             resolution = resolve_references(parsed_input, intent=intent)
             unresolved = _unique_models(intent.unresolved + (resolution.unresolved or []))
             intent.unresolved = unresolved
+            if _intent_empty(intent) and not unresolved:
+                unresolved = [UnresolvedReference(type="unparsed_utterance", raw=parsed_input.user_utterance, confidence=0.0, reason="no requirements could be extracted from the utterance")]
+                intent.unresolved = unresolved
             return IntentParserOutput(
                 request_type=request_type,
                 parser_mode=parser_mode,
@@ -51,6 +55,8 @@ class IntentParser:
         patch = model_validate(IntentPatch, raw_result.get("intent_patch", raw_result))
         resolution = resolve_references(parsed_input, patch=patch)
         unresolved = resolution.unresolved or []
+        if _patch_empty(patch) and not unresolved:
+            unresolved = [UnresolvedReference(type="unparsed_utterance", raw=parsed_input.user_utterance, confidence=0.0, reason="no requirements could be extracted from the utterance")]
         patch.affected_objects = list(dict.fromkeys(patch.affected_objects + (resolution.affected_objects or [])))
         return IntentParserOutput(
             request_type=request_type,
@@ -128,6 +134,41 @@ def _confidence_summary(*, intent: Optional[EditingIntent] = None, patch: Option
         values.extend(item.confidence for item in patch.add_operations + patch.update_operations)
         values.extend(item.confidence for item in patch.add_constraints + patch.update_constraints)
     return {"overall": round(sum(values) / len(values), 4) if values else 0.0}
+
+
+def _intent_empty(intent: EditingIntent) -> bool:
+    """Nothing extracted at all — the host should ask the user to clarify
+    rather than treat an empty intent as a successful parse."""
+    global_intent = intent.global_intent
+    global_set = any(
+        getattr(global_intent, field) is not None
+        for field in ("theme", "mood", "style", "pacing", "color_preference", "platform_style", "autonomy")
+    )
+    return not (
+        global_set
+        or intent.object_requirements
+        or intent.event_bound_requirements
+        or intent.explicit_operations
+        or intent.constraints
+    )
+
+
+def _patch_empty(patch: IntentPatch) -> bool:
+    return not (
+        patch.add_object_requirements
+        or patch.update_object_requirements
+        or patch.remove_object_requirement_ids
+        or patch.add_event_bound_requirements
+        or patch.update_event_bound_requirements
+        or patch.remove_event_bound_requirement_ids
+        or patch.add_operations
+        or patch.update_operations
+        or patch.remove_operation_ids
+        or patch.add_constraints
+        or patch.update_constraints
+        or patch.remove_constraint_ids
+        or patch.global_updates
+    )
 
 
 def _unique_models(items: list[Any]) -> list[Any]:
