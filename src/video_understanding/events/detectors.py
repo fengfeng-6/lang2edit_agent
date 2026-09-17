@@ -350,7 +350,8 @@ def _close_hands_score(frame: FrameObservation, ctx: DetectContext) -> FrameScor
 def _turn_body_score(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameScore]:
     """转身：肩宽相对全段中位数的收窄（侧对镜头时肩投影变窄）。"""
     widths = [(f.timestamp, shoulder_width(f) or 0.0) for f in tracks.frames]
-    base = median((w for _, w in widths if w > 1e-6), default=0.0)
+    valid = [w for _, w in widths if w > 1e-6]
+    base = median(valid) if valid else 0.0
     out: List[FrameScore] = []
     for frame, (_, w) in zip(tracks.frames, widths):
         conf = _clamp01((0.72 - w / base) / 0.5) if base > 1e-6 and w > 1e-6 else 0.0
