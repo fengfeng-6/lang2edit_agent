@@ -196,12 +196,34 @@ state/            manager.py    事件物化：event_uid/display_id/occurrence�
 
 - **手势**：heart_gesture、point_left/right、wave_hand、open/close_both_hands；
   thumbs_up/v_sign/ok_sign 已注册，依赖 hand landmarks 轨道（按需 §11）。
+- **无障碍扩展手势**（残障用户重点适配）：single_hand_heart（单手抱心/贴脸比心）、
+  finger_heart（手指比心，landmarks）、hand_raise（抬手）、head_tilt（歪头，
+  无需手部）、clap（拍手）。
 - **身体动作**：turn_body、move_left/right、jump、squat、stand_up、lean_body、
   approach_camera、ending_pose。
 - **Pose Condition**：above/below/near/crossed/left_of/right_of + min_duration。
 - **音频**：bpm、beat、downbeat、music_onset（chorus_start 已注册未实现）。
 - **结构**：video_start/end、first_action、last_action。
 - **开放语义**：运动能量提案 + 注入式 verifier；未配置 verifier 时 `failed`。
+
+### 无障碍适配（MobilityProfile）
+
+手势舞的重要用户群体包含残障人士（单侧上肢、轮椅坐姿、低幅度运动、
+手部震颤等）。`MobilityProfile` 描述主体可动性，输入 `video["profile"]`
+显式声明，或由 `spatial.profile.infer_mobility_profile` 从轨道覆盖度
+自动推断（`inferred=True`）：
+
+- `available_hands`：单手主体查询双手事件时自动降级为 `single_hand_variant`
+  （heart_gesture→single_hand_heart，事件标 `adapted_from`）；无变体时
+  `not_found` + note 说明，不误报；
+- `posture="seated"`：jump/squat/stand_up 不适用（not_found+note）；
+  pose condition 距离归一化改用肩宽（轮椅入框使 person bbox 宽度失真）；
+- `amplitude`/`amplitude_scale`：速度与外展阈值按比例缩放，低幅度动作
+  不再全员漏检；
+- `tremor`：轨迹输出前中值滤波 + 更宽平滑窗；
+- `mirrored`：前置镜像自拍 → 轨道加载时互换左右手/腕标签；
+- `confidence.sources.data_coverage`：span 内必需部位覆盖率 <0.5 时
+  confirmed 自动降为 uncertain——"缺肢体"不等于"没做动作"。
 
 ### 用法
 
@@ -264,7 +286,9 @@ python -m pytest
 条件编译（above/near/crossed/left_of/right_of）、规则检测器（比心两次发生、
 指向左右方向、ending_pose、landmark 依赖）、缓存覆盖与增量分析、
 not_found/failed 区分、空间快照与轨迹、音频事件物化、结构化事件、
-失效管理（依赖/视频/裁剪）、状态持久化往返、CLI 往返、模块一查询对接。
+失效管理（依赖/视频/裁剪）、状态持久化往返、CLI 往返、模块一查询对接、
+无障碍适配（profile 推断、单手降级、坐姿归一化、低幅度阈值、震颤平滑、
+镜像修正、覆盖度降级）。
 
 新增模块的测试放在 `tests/<模块短名>/` 下（如 `tests/video/`），
 各目录内测试文件 basename 需全局唯一（pytest prepend 导入模式要求）。

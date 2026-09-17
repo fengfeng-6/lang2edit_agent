@@ -26,26 +26,33 @@ class EventRegistryEntry:
     temporal: TemporalConfig = field(default_factory=TemporalConfig)
     dependencies: List[str] = field(default_factory=list)
     aliases: List[str] = field(default_factory=list)
+    # ---- 无障碍适配（MobilityProfile）----
+    requires_hands: int = 0           # 需要的可用手数：0/1/2
+    single_hand_variant: Optional[str] = None  # 单手主体上的替代 canonical
+    not_seated: bool = False          # 坐姿主体上不适用（jump/squat/stand_up）
 
 
 def _gesture(canonical: str, detector: Optional[str], *, supported: bool = True,
              deps: Optional[List[str]] = None, aliases: Optional[List[str]] = None,
+             requires_hands: int = 1, single_hand_variant: Optional[str] = None,
              **kw) -> EventRegistryEntry:
     return EventRegistryEntry(
         canonical=canonical, event_type=EventType.gesture, supported=supported,
         strategy="dedicated_detector", detector=detector,
         temporal=TemporalConfig(**kw),
         dependencies=deps or ["pose_track"], aliases=aliases or [],
+        requires_hands=requires_hands, single_hand_variant=single_hand_variant,
     )
 
 
 def _body(canonical: str, detector: Optional[str], *, supported: bool = True,
-          aliases: Optional[List[str]] = None, **kw) -> EventRegistryEntry:
+          aliases: Optional[List[str]] = None, not_seated: bool = False,
+          **kw) -> EventRegistryEntry:
     return EventRegistryEntry(
         canonical=canonical, event_type=EventType.body_action, supported=supported,
         strategy="dedicated_detector", detector=detector,
         temporal=TemporalConfig(**kw),
-        dependencies=["pose_track"], aliases=aliases or [],
+        dependencies=["pose_track"], aliases=aliases or [], not_seated=not_seated,
     )
 
 
@@ -53,15 +60,25 @@ _REGISTRY: Dict[str, EventRegistryEntry] = {e.canonical: e for e in [
     # ---- Gesture（§15/§59 MVP 手势集）----
     _gesture("heart_gesture", "heart_gesture",
              min_duration=0.15, merge_gap=0.20, threshold=0.5, candidate_threshold=0.3,
-             aliases=["heart"]),
+             aliases=["heart"], requires_hands=2, single_hand_variant="single_hand_heart"),
     _gesture("point_left", "point_left", min_duration=0.12, merge_gap=0.15),
     _gesture("point_right", "point_right", min_duration=0.12, merge_gap=0.15),
     _gesture("wave_hand", "wave_hand", min_duration=0.30, merge_gap=0.10,
              aliases=["wave"]),
     _gesture("open_both_hands", "open_both_hands", min_duration=0.15, merge_gap=0.15,
-             aliases=["hands_open"]),
+             aliases=["hands_open"], requires_hands=2),
     _gesture("close_both_hands", "close_both_hands", min_duration=0.15, merge_gap=0.15,
-             aliases=["hands_close", "hands_together"]),
+             aliases=["hands_close", "hands_together"], requires_hands=2),
+    # ---- 单手/上肢友好手势（无障碍扩展集）----
+    _gesture("single_hand_heart", "single_hand_heart",
+             min_duration=0.15, merge_gap=0.20, threshold=0.45, candidate_threshold=0.25,
+             aliases=["one_hand_heart", "hand_on_chest"]),
+    _gesture("hand_raise", "hand_raise", min_duration=0.15, merge_gap=0.15,
+             aliases=["raise_hand", "hand_up"]),
+    _gesture("head_tilt", "head_tilt", min_duration=0.2, merge_gap=0.2,
+             aliases=["tilt_head"], requires_hands=0),
+    _gesture("clap", "clap", min_duration=0.05, merge_gap=0.15, threshold=0.5,
+             requires_hands=2, aliases=["clap_hands"]),
     # 需要 hand landmarks（§11 按需分析）：轨道缺失时 query 记 failed。
     _gesture("thumbs_up", "thumbs_up", deps=["hand_landmark_track"],
              min_duration=0.15, merge_gap=0.15, aliases=["thumb_up"]),
@@ -69,13 +86,15 @@ _REGISTRY: Dict[str, EventRegistryEntry] = {e.canonical: e for e in [
              min_duration=0.15, merge_gap=0.15, aliases=["victory"]),
     _gesture("ok_sign", "ok_sign", deps=["hand_landmark_track"],
              min_duration=0.15, merge_gap=0.15, aliases=["ok"]),
+    _gesture("finger_heart", "finger_heart", deps=["hand_landmark_track"],
+             min_duration=0.1, merge_gap=0.15, aliases=["snap_heart", "korean_heart"]),
     # ---- Body Action（§15/§59）----
     _body("turn_body", "turn_body", min_duration=0.25, merge_gap=0.30),
     _body("move_left", "move_left", min_duration=0.20, merge_gap=0.20),
     _body("move_right", "move_right", min_duration=0.20, merge_gap=0.20),
-    _body("jump", "jump", min_duration=0.10, merge_gap=0.25),
-    _body("squat", "squat", min_duration=0.25, merge_gap=0.30),
-    _body("stand_up", "stand_up", min_duration=0.20, merge_gap=0.30),
+    _body("jump", "jump", not_seated=True, min_duration=0.10, merge_gap=0.25),
+    _body("squat", "squat", not_seated=True, min_duration=0.25, merge_gap=0.30),
+    _body("stand_up", "stand_up", not_seated=True, min_duration=0.20, merge_gap=0.30),
     _body("lean_body", "lean_body", min_duration=0.25, merge_gap=0.30),
     _body("approach_camera", "approach_camera", min_duration=0.30, merge_gap=0.30),
     _body("ending_pose", "ending_pose", min_duration=0.30, merge_gap=0.20,

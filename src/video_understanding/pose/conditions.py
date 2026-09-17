@@ -64,11 +64,12 @@ def _reference_point(frame: FrameObservation, reference: str) -> Optional[Point2
     return frame.keypoints.get(reference)
 
 
-def compile_condition(condition: dict) -> Callable[[FrameObservation], float]:
+def compile_condition(condition: dict, norm_scale: str = "person") -> Callable[[FrameObservation], float]:
     """结构化条件 → 单帧评分谓词（0..1）。
 
     支持 relation：above / below / left_of / right_of / near / crossed。
     条件可带 ``delta`` 覆盖默认阈值；``min_duration`` 由聚合层读取。
+    ``norm_scale="shoulder"`` 用于坐姿主体（person bbox 含轮椅会失真）。
     """
     subject = condition.get("subject", "hand")
     relation = condition.get("relation", "near")
@@ -90,7 +91,7 @@ def compile_condition(condition: dict) -> Callable[[FrameObservation], float]:
             return 1.0 if a[0] > b[0] + d else 0.0
         if relation in ("near", "beside", "close_to"):
             d = delta or DEFAULT_NEAR_DELTA
-            dist = normalized_distance(a, b, frame)
+            dist = normalized_distance(a, b, frame, scale_mode=norm_scale)
             return max(0.0, 1.0 - dist / d)
         return 0.0
 
@@ -105,13 +106,13 @@ def compile_condition(condition: dict) -> Callable[[FrameObservation], float]:
         # 面对镜头时"双手交叉"= 左手出现在画面右侧（left.x > right.x）。
         if left[0] <= right[0]:
             return 0.0
-        dist = normalized_distance(left, right, frame)
+        dist = normalized_distance(left, right, frame, scale_mode=norm_scale)
         if dist > DEFAULT_CROSS_MAX_DIST:
             return 0.0
         ref = _reference_point(frame, reference) if reference else None
         if ref is not None:
             mid = ((left[0] + right[0]) / 2, (left[1] + right[1]) / 2)
-            if normalized_distance(mid, ref, frame) > (delta or DEFAULT_NEAR_DELTA):
+            if normalized_distance(mid, ref, frame, scale_mode=norm_scale) > (delta or DEFAULT_NEAR_DELTA):
                 return 0.0
         return max(0.5, 1.0 - dist / DEFAULT_CROSS_MAX_DIST)
 

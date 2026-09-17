@@ -50,6 +50,39 @@ class StrictModel(BaseModel):
         validate_assignment = True
 
 
+class MobilityProfile(StrictModel):
+    """视频中主体的可动性画像（无障碍适配的核心输入）。
+
+    手势舞的重要用户群体包括单侧上肢、坐姿（轮椅）、低幅度运动、
+    震颤等身体状况的用户。profile 由调用方显式声明（用户设置/模块一
+    上下文），或由 ``spatial.profile.infer_mobility_profile`` 从轨道
+    覆盖度自动推断；``inferred=True`` 表示推断值。
+
+    下游语义：
+    - ``available_hands``：双手事件（比心/双手开合/拍手）在单手主体上
+      自动降级为 ``single_hand_variant``；无变体时 not_found + note；
+    - ``posture="seated"``：jump/squat/stand_up 不适用；空间归一化
+      改用肩宽（person bbox 常含轮椅，宽度失真）；
+    - ``amplitude`` / ``amplitude_scale``：速度/外展阈值按比例缩放；
+    - ``tremor``：轨迹输出前加中值滤波，检测窗口放宽；
+    - ``mirrored``：前置镜像自拍 → 轨道加载时互换左右手/腕标签
+      （画面方向语义不变——Planner 关心的是观众看到的方向）。
+    """
+
+    available_hands: List[str] = Field(default_factory=lambda: ["left", "right"])
+    posture: str = "standing"          # standing / seated / lying
+    amplitude: str = "normal"          # normal / low / very_low
+    tremor: bool = False
+    mirrored: bool = False
+    inferred: bool = False
+    amplitude_scale: float = 1.0       # 阈值缩放（推断时由运动量分布得出）
+
+    @validator("available_hands")
+    def hands_valid(cls, value: List[str]) -> List[str]:
+        valid = [h for h in value if h in ("left", "right")]
+        return valid
+
+
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
@@ -313,9 +346,24 @@ class DenseSpatialTracks(StrictModel):
             return frame.hand_center(accessor.split("_")[0])
         return frame.keypoints.get(accessor)
 
-    def trajectory(self, accessor: str, *, smooth_half_window: int = 3) -> Trajectory:
-        """提取轨迹并做滑动平均平滑（§9.4：对上层暴露 Smooth(T)）。"""
+    def trajectory(self, accessor: str, *, smooth_half_window: int = 3,
+                   median_prefilter: bool = False) -> Trajectory:
+        """提取轨迹并做滑动平均平滑（§9.4：对上层暴露 Smooth(T)）。
+
+        ``median_prefilter=True``（震颤主体 MobilityProfile.tremor）先做
+        中值滤波去除抖动尖刺，再做滑动平均。
+        """
         raw = self.series(accessor)
+        if median_prefilter and len(raw) >= 3:
+            filtered: List[Tuple[float, Point2]] = []
+            for i, (t, p) in enumerate(raw):
+                lo = max(0, i - 1)
+                hi = min(len(raw), i + 2)
+                xs = sorted(raw[j][1][0] for j in range(lo, hi))
+                ys = sorted(raw[j][1][1] for j in range(lo, hi))
+                mid = (hi - lo) // 2
+                filtered.append((t, (xs[mid], ys[mid])))
+            raw = filtered
         if len(raw) < 2 * smooth_half_window + 1:
             points = [TrajectoryPoint(t=t, x=p[0], y=p[1]) for t, p in raw]
             return Trajectory(target=accessor, points=points, smoothed=False)
@@ -547,6 +595,7 @@ class SemanticVideoState(StrictModel):
     state_id: str
     version: int = 1
     video: VideoMetadata
+    subject_profile: MobilityProfile = Field(default_factory=MobilityProfile)
     semantic_events: List[SemanticEvent] = Field(default_factory=list)
     spatial_snapshots: Dict[str, SpatialSnapshot] = Field(default_factory=dict)
     track_artifact_ids: List[str] = Field(default_factory=list)
@@ -572,6 +621,7 @@ class QueryResult(StrictModel):
     selected_event_uids: List[str] = Field(default_factory=list)  # occurrence 过滤后
     cache_hit: bool = False
     error: Optional[str] = None
+    note: Optional[str] = None  # 信息性说明（如单手降级、坐姿不适用），非错误
 
 
 class VideoAnalysisResult(StrictModel):

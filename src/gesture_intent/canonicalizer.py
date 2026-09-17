@@ -9,12 +9,23 @@ from .models import EventType, SemanticValue
 
 
 GESTURE_SYNONYMS = {
+    "单手比心": "single_hand_heart",
+    "抱心": "single_hand_heart",
+    "手指比心": "finger_heart",
+    "韩式比心": "finger_heart",
     "比心": "heart_gesture",
     "做爱心": "heart_gesture",
     "摆成爱心": "heart_gesture",
     "手摆成一个心": "heart_gesture",
     "手摆成心": "heart_gesture",
     "爱心动作": "heart_gesture",
+    "抬手": "hand_raise",
+    "举手": "hand_raise",
+    "手举起来": "hand_raise",
+    "歪头": "head_tilt",
+    "拍手": "clap",
+    "鼓掌": "clap",
+    "打招呼": "wave_hand",
     "指向左": "point_left",
     "指向左侧": "point_left",
     "往左指": "point_left",

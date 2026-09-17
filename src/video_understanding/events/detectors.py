@@ -13,11 +13,17 @@ hybrid 融合 §25，当前实现为单证据规则，置信度来源记在 sour
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import median
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..models import DenseSpatialTracks, Direction, FrameObservation, Point2
+from ..models import (
+    DenseSpatialTracks,
+    Direction,
+    FrameObservation,
+    MobilityProfile,
+    Point2,
+)
 from ..pose.motion import motion_energy
 from ..spatial.snapshot import hand_pair_anchor, shoulder_width
 
@@ -82,7 +88,11 @@ Extras = Tuple[Optional[Point2], Optional[Direction], dict]  # anchor, direction
 
 
 class RuleDetector:
-    """逐帧打分器：score() 产出 FrameScore 序列，extras_at() 描述 peak 帧。"""
+    """逐帧打分器：score() 产出 FrameScore 序列，extras_at() 描述 peak 帧。
+
+    ``required_parts`` 声明检测所依赖的部位（覆盖度统计用）："any_hand" /
+    "both_hands" / 具体部位名。span 内覆盖率会写入事件置信度来源。
+    """
 
     version = "rule_v1"
 
@@ -91,10 +101,12 @@ class RuleDetector:
         score_fn: Callable[[DenseSpatialTracks, "DetectContext"], List[FrameScore]],
         extras_fn: Optional[Callable[[DenseSpatialTracks, float], Extras]] = None,
         post_filter_fn: Optional[Callable[[list, "DetectContext"], list]] = None,
+        required_parts: Optional[List[str]] = None,
     ):
         self._score_fn = score_fn
         self._extras_fn = extras_fn
         self._post_filter_fn = post_filter_fn
+        self.required_parts = required_parts or []
 
     def score(self, tracks: DenseSpatialTracks, ctx: "DetectContext") -> List[FrameScore]:
         return self._score_fn(tracks, ctx)
@@ -116,19 +128,61 @@ class RuleDetector:
 
 @dataclass
 class DetectContext:
-    """检测上下文：视频时长等轨道外信息。"""
+    """检测上下文：视频时长与主体可动性画像（无障碍适配）。
+
+    ``profile.amplitude_scale`` 缩放速度/外展类阈值——低幅度用户
+    （轮椅、上肢受限）的动作在绝对阈值下会全部漏检。
+    """
 
     duration: float = 0.0
+    profile: MobilityProfile = field(default_factory=MobilityProfile)
+
+
+def parts_present(frame: FrameObservation, parts: List[str]) -> bool:
+    """检测所需部位在该帧是否齐备（data coverage 统计）。
+
+    "any_hand"/"both_hands" 优先以 hand 观测为准（该帧有 hands 记录时），
+    否则退化为腕关键点——缺手侧腕点可能是前臂末端，不能当手。
+    """
+    def hand_ok(side: str) -> bool:
+        if frame.hands:
+            return frame.hands.get(side) is not None
+        return frame.hand_center(side) is not None
+
+    for part in parts:
+        if part == "any_hand":
+            if not hand_ok("left") and not hand_ok("right"):
+                return False
+            continue
+        if part == "both_hands":
+            if not hand_ok("left") or not hand_ok("right"):
+                return False
+            continue
+        if part == "face":
+            if frame.face_bbox is None:
+                return False
+            continue
+        if part == "person":
+            if frame.person_bbox is None:
+                return False
+            continue
+        if DenseSpatialTracks._resolve_point(frame, part) is None:
+            return False
+    return True
 
 
 def _per_frame(
     scorer: Callable[[FrameObservation, DetectContext], FrameScore],
     extras_fn: Optional[Callable[[DenseSpatialTracks, float], Extras]] = None,
+    required_parts: Optional[List[str]] = None,
 ) -> RuleDetector:
     """把"逐帧打分函数"适配成 RuleDetector。
 
     零置信度帧也必须保留——否则两段分离的动作在采样序列里变成相邻
     样本，时间缺口消失，aggregator 会把多次发生错误并成一段（§16）。
+
+    默认 extras_fn 用同一 scorer 重打 peak 帧，把该帧的 anchor /
+    direction / properties（如 pointing_hand）一并提取。
     """
 
     def score_fn(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameScore]:
@@ -140,7 +194,18 @@ def _per_frame(
                 out.append(s)
         return out
 
-    return RuleDetector(score_fn, extras_fn)
+    if extras_fn is None:
+        def extras_fn(tracks: DenseSpatialTracks, timestamp: float) -> Extras:
+            frame = tracks.at(timestamp)
+            if frame is None:
+                return None, None, {}
+            s = scorer(frame, DetectContext())
+            if s is not None and s.conf > 0:
+                return (s.anchor or hand_pair_anchor(frame) or frame.body_center(),
+                        s.direction, s.properties or {})
+            return hand_pair_anchor(frame) or frame.body_center(), None, {}
+
+    return RuleDetector(score_fn, extras_fn, required_parts=required_parts)
 
 
 def _anchor_extras(resolve: Callable[[FrameObservation], Optional[Point2]]):
@@ -176,10 +241,16 @@ def _heart_score(frame: FrameObservation, ctx: DetectContext) -> FrameScore:
 
 
 def _make_point_scorer(sign: float) -> Callable[[FrameObservation, DetectContext], FrameScore]:
-    """指向 sign<0 画面左 / sign>0 画面右：腕相对肩外展 + 手臂近水平。"""
+    """指向 sign<0 画面左 / sign>0 画面右：腕相对肩外展 + 手臂近水平。
+
+    外展阈值随 ``profile.amplitude_scale`` 缩放（低幅度用户手臂
+    伸展可能不到完整肩宽）。
+    """
 
     def scorer(frame: FrameObservation, ctx: DetectContext) -> FrameScore:
         scale = _scale(frame)
+        amp = ctx.profile.amplitude_scale
+        need = 0.8 * max(amp, 0.55)
         best = FrameScore(frame.timestamp, 0.0)
         for side in ("left", "right"):
             wrist = frame.hand_center(side)
@@ -189,10 +260,10 @@ def _make_point_scorer(sign: float) -> Callable[[FrameObservation, DetectContext
                 continue
             dx = wrist[0] - shoulder[0]
             extension = (dx * sign) / scale
-            if extension <= 0.8:
+            if extension <= need:
                 continue
             horizontal = 1.0 - _clamp01(abs(wrist[1] - shoulder[1]) / (abs(dx) + 1e-6))
-            conf = _clamp01((extension - 0.8) / 1.2) * _clamp01(0.4 + 0.6 * horizontal)
+            conf = _clamp01((extension - need) / (1.5 * need)) * _clamp01(0.4 + 0.6 * horizontal)
             if conf > best.conf:
                 base = elbow or shoulder
                 best = FrameScore(
@@ -206,8 +277,12 @@ def _make_point_scorer(sign: float) -> Callable[[FrameObservation, DetectContext
 
 
 def _wave_score(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameScore]:
-    """挥手：手腕高过肩 + 水平振荡（0.6s 窗口内 x 位移幅度）。"""
-    window = 0.6
+    """挥手：手腕高过肩 + 水平振荡（0.6s 窗口内 x 位移幅度）。
+
+    低幅度用户振荡范围按 amplitude_scale 放宽；震颤主体窗口加长。
+    """
+    window = 0.9 if ctx.profile.tremor else 0.6
+    amp = ctx.profile.amplitude_scale
     history: Dict[str, List[Tuple[float, float]]] = {"left": [], "right": []}
     out: List[FrameScore] = []
     for frame in tracks.frames:
@@ -224,7 +299,7 @@ def _wave_score(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameSco
                     xs = [x for t, x in history[side] if frame.timestamp - window <= t]
                     xs.append(wrist[0])
                     x_range = (max(xs) - min(xs)) / scale if xs else 0.0
-                    oscillation = _clamp01((x_range - 0.3) / 0.7)
+                    oscillation = _clamp01((x_range - 0.3 * amp) / (0.7 * amp))
                     conf = _clamp01(raised * (0.4 + 0.6 * oscillation))
                     if conf > best.conf:
                         best = FrameScore(frame.timestamp, conf, anchor=wrist,
@@ -285,19 +360,24 @@ def _turn_body_score(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[Fra
 
 
 def _make_move_score(sign: float) -> Callable[[DenseSpatialTracks, DetectContext], List[FrameScore]]:
-    """整体左移 / 右移：person center 在 0.4s 窗口内的水平速度。"""
+    """整体左移 / 右移：person center 在 0.4s 窗口内的水平速度。
+
+    速度阈值按 amplitude_scale 缩放（轮椅平移/低幅度位移也成立）。
+    """
 
     def score_fn(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameScore]:
         series = tracks.series("person")
         window = 0.4
+        amp = ctx.profile.amplitude_scale
         out: List[FrameScore] = []
         for i, (t, p) in enumerate(series):
             past = next(((pt, pp) for pt, pp in reversed(series[:i]) if t - window <= pt), None)
             conf = 0.0
+            vx = 0.0
             if past is not None:
                 dt = max(t - past[0], 1e-6)
                 vx = (p[0] - past[1][0]) / dt * sign
-                conf = _clamp01((vx - 0.08) / 0.25)
+                conf = _clamp01((vx - 0.08 * amp) / (0.25 * amp))
             out.append(FrameScore(t, conf, anchor=p if conf > 0 else None,
                                   direction=Direction.from_delta(vx * sign, 0.0) if conf > 0 else None))
         # 无 person 观测的帧也补 0，保持时间轴完整
@@ -313,6 +393,7 @@ def _make_move_score(sign: float) -> Callable[[DenseSpatialTracks, DetectContext
 
 def _jump_score(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameScore]:
     """跳跃：头部竖直速度向上的尖峰（y 向下为正，向上速度为负）。"""
+    amp = ctx.profile.amplitude_scale
     out: List[FrameScore] = []
     prev: Optional[Tuple[float, Point2]] = None
     for frame in tracks.frames:
@@ -321,7 +402,7 @@ def _jump_score(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameSco
         if head is not None and prev is not None:
             dt = max(frame.timestamp - prev[0], 1e-6)
             vy = (head[1] - prev[1][1]) / dt
-            conf = _clamp01((-vy - 0.25) / 0.9)
+            conf = _clamp01((-vy - 0.25 * amp) / (0.9 * amp))
         out.append(FrameScore(frame.timestamp, conf, anchor=head if conf > 0 else None))
         if head is not None:
             prev = (frame.timestamp, head)
@@ -423,6 +504,94 @@ def _ending_pose_post_filter(spans: list, ctx: DetectContext) -> list:
 
 
 # ---------------------------------------------------------------------------
+# 单手 / 上肢友好手势（无障碍扩展）
+# ---------------------------------------------------------------------------
+
+
+def _single_hand_heart_score(frame: FrameObservation, ctx: DetectContext) -> FrameScore:
+    """单手比心：一只手贴近胸前正中（抱心）或同侧脸颊旁（cheek heart）。
+
+    面向只有一只可用手的用户；语义上等价于双手比心的表达意图。
+    """
+    chest = None
+    ls = frame.keypoints.get("left_shoulder")
+    rs = frame.keypoints.get("right_shoulder")
+    if ls and rs:
+        chest = ((ls[0] + rs[0]) / 2, (ls[1] + rs[1]) / 2 + _torso_len(frame) * 0.35)
+    best = FrameScore(frame.timestamp, 0.0)
+    for side in ctx.profile.available_hands or ("left", "right"):
+        hand = frame.hand_center(side)
+        if hand is None:
+            continue
+        conf = 0.0
+        if chest is not None:
+            d = _dist(hand, chest) / _scale(frame)
+            conf = max(conf, _clamp01(1.0 - d / 0.55))
+        if frame.face_bbox is not None:
+            fx1, fy1, fx2, fy2 = frame.face_bbox
+            # 同侧脸颊边缘（left 手贴左脸——画面坐标 left 即人物自身 left）
+            cheek_x = fx1 if side == "left" else fx2
+            cheek = (cheek_x, (fy1 + fy2) / 2)
+            d = _dist(hand, cheek) / _scale(frame)
+            conf = max(conf, _clamp01(1.0 - d / 0.5) * 0.9)
+        if conf > best.conf:
+            best = FrameScore(frame.timestamp, conf, anchor=hand,
+                              properties={"heart_hand": side})
+    return best
+
+
+def _hand_raise_score(frame: FrameObservation, ctx: DetectContext) -> FrameScore:
+    """抬手 / 举手：任一腕高于肩线（单手用户最基础的触发动作）。"""
+    sh_y = _shoulder_y(frame)
+    if sh_y is None:
+        return FrameScore(frame.timestamp, 0.0)
+    scale = _scale(frame)
+    best = FrameScore(frame.timestamp, 0.0)
+    for side in ctx.profile.available_hands or ("left", "right"):
+        wrist = frame.hand_center(side)
+        if wrist is None:
+            continue
+        conf = _clamp01((sh_y - wrist[1]) / scale - 0.05)
+        if conf > best.conf:
+            best = FrameScore(frame.timestamp, conf, anchor=wrist,
+                              properties={"raised_hand": side})
+    return best
+
+
+def _head_tilt_score(frame: FrameObservation, ctx: DetectContext) -> FrameScore:
+    """歪头：头中心横向偏离双肩中点（无需手部参与）。"""
+    head = frame.head_center()
+    ls = frame.keypoints.get("left_shoulder")
+    rs = frame.keypoints.get("right_shoulder")
+    if head is None or not ls or not rs:
+        return FrameScore(frame.timestamp, 0.0)
+    mid_x = (ls[0] + rs[0]) / 2
+    offset = abs(head[0] - mid_x) / max(_scale(frame), 1e-6)
+    conf = _clamp01((offset - 0.35) / 0.4)
+    return FrameScore(frame.timestamp, conf, anchor=head,
+                      properties={"tilt_side": "left" if head[0] < mid_x else "right"})
+
+
+def _clap_score(frame: FrameObservation, ctx: DetectContext) -> FrameScore:
+    """拍手：双手在躯干前方近距接触（瞬态，靠 temporal_config 区分
+    与 close_both_hands 的持续合拢——clap 的 min_duration 更短）。"""
+    lw = frame.hand_center("left")
+    rw = frame.hand_center("right")
+    sh_y = _shoulder_y(frame)
+    if not lw or not rw or sh_y is None:
+        return FrameScore(frame.timestamp, 0.0)
+    scale = _scale(frame)
+    d = _dist(lw, rw) / scale
+    contact = _clamp01((0.4 - d) / 0.3)
+    hip_y = sh_y + _torso_len(frame)
+    mid_y = (lw[1] + rw[1]) / 2
+    in_front = 1.0 if sh_y - 0.2 * scale <= mid_y <= hip_y + 0.2 * scale else 0.2
+    conf = _clamp01(contact * in_front)
+    return FrameScore(frame.timestamp, conf,
+                      anchor=((lw[0] + rw[0]) / 2, (lw[1] + rw[1]) / 2))
+
+
+# ---------------------------------------------------------------------------
 # Hand-landmark 打分器（按需轨道，§11）
 # ---------------------------------------------------------------------------
 
@@ -497,6 +666,19 @@ def _ok_sign_fn(pts: Dict[str, Point2]) -> float:
     return _clamp01(circle * 0.7 + others * 0.3)
 
 
+def _finger_heart_fn(pts: Dict[str, Point2]) -> float:
+    """手指比心（韩式比心）：拇指与食指指尖近距交叉 + 手指基本伸展。
+
+    单手即可完成的比心，是低活动度用户最常用的"爱心"表达。
+    """
+    thumb_tip, index_tip = pts.get("thumb_tip"), pts.get("index_tip")
+    if not thumb_tip or not index_tip:
+        return 0.0
+    closeness = _clamp01(1.0 - _dist(thumb_tip, index_tip) / (_hand_size(pts) * 0.45 + 1e-6))
+    ext = (_finger_extended(pts, "index") + _finger_extended(pts, "middle")) / 2
+    return _clamp01(closeness * 0.7 + ext * 0.3)
+
+
 def _landmark_detector(fn: Callable[[Dict[str, Point2]], float]) -> RuleDetector:
     def score_fn(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameScore]:
         _require_landmarks(tracks)
@@ -509,7 +691,7 @@ def _landmark_detector(fn: Callable[[Dict[str, Point2]], float]) -> RuleDetector
         s = _landmark_score_frame(frame, fn)
         return s.anchor or frame.body_center(), s.direction, s.properties or {}
 
-    return RuleDetector(score_fn, extras)
+    return RuleDetector(score_fn, extras, required_parts=["any_hand"])
 
 
 # ---------------------------------------------------------------------------
@@ -519,38 +701,48 @@ def _landmark_detector(fn: Callable[[Dict[str, Point2]], float]) -> RuleDetector
 
 def build_detector(name: str) -> RuleDetector:
     if name == "heart_gesture":
-        return _per_frame(_heart_score)
+        return _per_frame(_heart_score, required_parts=["both_hands"])
     if name == "point_left":
-        return _per_frame(_make_point_scorer(-1.0))
+        return _per_frame(_make_point_scorer(-1.0), required_parts=["any_hand"])
     if name == "point_right":
-        return _per_frame(_make_point_scorer(1.0))
+        return _per_frame(_make_point_scorer(1.0), required_parts=["any_hand"])
     if name == "wave_hand":
-        return RuleDetector(_wave_score)
+        return RuleDetector(_wave_score, required_parts=["any_hand"])
     if name == "open_both_hands":
-        return _per_frame(_open_hands_score)
+        return _per_frame(_open_hands_score, required_parts=["both_hands"])
     if name == "close_both_hands":
-        return _per_frame(_close_hands_score)
+        return _per_frame(_close_hands_score, required_parts=["both_hands"])
+    if name == "single_hand_heart":
+        return _per_frame(_single_hand_heart_score, required_parts=["any_hand"])
+    if name == "hand_raise":
+        return _per_frame(_hand_raise_score, required_parts=["any_hand"])
+    if name == "head_tilt":
+        return _per_frame(_head_tilt_score, required_parts=["head"])
+    if name == "clap":
+        return _per_frame(_clap_score, required_parts=["both_hands"])
     if name == "turn_body":
-        return RuleDetector(_turn_body_score)
+        return RuleDetector(_turn_body_score,
+                            required_parts=["left_shoulder", "right_shoulder"])
     if name == "move_left":
-        return RuleDetector(_make_move_score(-1.0))
+        return RuleDetector(_make_move_score(-1.0), required_parts=["person"])
     if name == "move_right":
-        return RuleDetector(_make_move_score(1.0))
+        return RuleDetector(_make_move_score(1.0), required_parts=["person"])
     if name == "jump":
-        return RuleDetector(_jump_score)
+        return RuleDetector(_jump_score, required_parts=["head"])
     if name == "squat":
-        return RuleDetector(_squat_score)
+        return RuleDetector(_squat_score, required_parts=["head"])
     if name == "stand_up":
-        return RuleDetector(_stand_up_score)
+        return RuleDetector(_stand_up_score, required_parts=["head"])
     if name == "lean_body":
-        return _per_frame(_lean_body_score)
+        return _per_frame(_lean_body_score, required_parts=["head"])
     if name == "approach_camera":
-        return RuleDetector(_approach_score)
+        return RuleDetector(_approach_score, required_parts=["person"])
     if name == "ending_pose":
         return RuleDetector(
             _ending_pose_score,
             _anchor_extras(lambda f: f.body_center() or f.head_center()),
             post_filter_fn=_ending_pose_post_filter,
+            required_parts=["person"],
         )
     if name == "thumbs_up":
         return _landmark_detector(_thumbs_up_fn)
@@ -558,4 +750,6 @@ def build_detector(name: str) -> RuleDetector:
         return _landmark_detector(_v_sign_fn)
     if name == "ok_sign":
         return _landmark_detector(_ok_sign_fn)
+    if name == "finger_heart":
+        return _landmark_detector(_finger_heart_fn)
     raise KeyError(f"no detector named {name}")

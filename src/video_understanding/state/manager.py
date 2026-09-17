@@ -118,10 +118,11 @@ class SemanticStateManager:
         extras_fn: ExtrasFn = None,
         event_properties: Optional[dict] = None,
         confidence_sources: Optional[Dict[str, float]] = None,
+        span_sources: Optional[List[Dict[str, float]]] = None,
     ) -> List[SemanticEvent]:
         """候选区间 → SemanticEvent 入库：分配 uid、快照、occurrence 编号。"""
         created: List[SemanticEvent] = []
-        for span in spans:
+        for i, span in enumerate(spans):
             uid = event_uid_for(
                 self.state.video.video_id, canonical,
                 span.temporal.start_time, span.temporal.peak_time, span.temporal.end_time,
@@ -144,7 +145,8 @@ class SemanticStateManager:
                 confidence=Confidence(
                     overall=span.confidence,
                     status=span.status,
-                    sources=dict(confidence_sources or {}),
+                    sources={**(confidence_sources or {}),
+                             **((span_sources or [{}])[i] if span_sources and i < len(span_sources) else {})},
                 ),
                 detector=detector,
                 properties={**(event_properties or {}), **(props or {})},

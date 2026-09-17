@@ -66,14 +66,22 @@ def build_snapshot(
     )
 
 
-def normalized_distance(a: Point2, b: Point2, frame: FrameObservation) -> float:
-    """按人物宽度归一化的两点距离（§21）：d_norm = ||p_a - p_b|| / w_person。
+def normalized_distance(a: Point2, b: Point2, frame: FrameObservation,
+                        scale_mode: str = "person") -> float:
+    """两点距离归一化（§21 的 d_norm）。
 
-    person_bbox 缺失时退化为未归一化欧氏距离。
+    - ``person``：||p_a - p_b|| / w_person（默认，person bbox 宽度）；
+    - ``shoulder``：肩宽 × 2.5 作为人体宽度等效——坐姿主体（轮椅入框
+      使 person bbox 失真）或上半身构图下更稳定。
     """
     import math
 
     dist = math.hypot(a[0] - b[0], a[1] - b[1])
+    if scale_mode == "shoulder":
+        sw = shoulder_width(frame)
+        if sw and sw > 1e-4:
+            return dist / (sw * 2.5)
+        # 肩不可见时退化到 person 宽
     if frame.person_bbox:
         width = frame.person_bbox[2] - frame.person_bbox[0]
         if width > 1e-6:

@@ -25,11 +25,17 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
 
-from gesture_intent.models import RequiredVideoQuery
+from gesture_intent.models import RequiredVideoQuery, model_validate
 
 from .audio.analyzer import AudioAnalyzer, LibrosaAudioAnalyzer, ProvidedAudioAnalyzer
 from .events.aggregator import AggregatedSpan, TemporalConfig, aggregate
-from .events.detectors import DependencyError, DetectContext, build_detector
+from .events.detectors import (
+    DependencyError,
+    DetectContext,
+    build_detector,
+    parts_present,
+)
+from .events import registry
 from .events.open_semantic import MotionEnergyProposer, OpenSemanticVerifier, detect_open_semantic
 from .events.router import RoutedPlan, normalize_query, route
 from .events.structural import resolve_structural
@@ -40,6 +46,7 @@ from .models import (
     DenseSpatialTracks,
     DetectorInfo,
     EventType,
+    MobilityProfile,
     QueryResult,
     QueryStatus,
     SemanticEvent,
@@ -55,6 +62,7 @@ from .pose.conditions import compile_condition, condition_min_duration
 from .preprocessing.metadata import resolve_metadata
 from .spatial.loaders import SpatialAnalyzer, load_tracks
 from .spatial.mediapipe_backend import MediaPipeSpatialAnalyzer
+from .spatial.profile import infer_mobility_profile, mirror_tracks
 from .state.cache import select_by_occurrence
 from .state.manager import SemanticStateManager
 from .state.store import SemanticStateStore
@@ -101,11 +109,22 @@ class VideoUnderstanding:
         self._manager = manager
         warnings: List[str] = []
 
+        declared_profile = None
         if isinstance(video, dict):
             for asset_id, payload in (video.get("audio") or {}).items():
                 self._audio_inputs[asset_id] = payload
+            if video.get("profile"):
+                declared_profile = model_validate(MobilityProfile, video["profile"])
 
         tracks = self._produce_tracks(video, metadata, warnings)
+        if tracks is not None and declared_profile is not None and declared_profile.mirrored:
+            mirror_tracks(tracks)  # 前置镜像自拍：先修正左右手标签再分析
+        # 可动性画像：显式声明优先，否则从轨道覆盖度自动推断
+        profile = declared_profile
+        if profile is None and tracks is not None:
+            profile = infer_mobility_profile(tracks)
+        manager.state.subject_profile = profile or MobilityProfile()
+
         base_ref = manager.attach_tracks(tracks) if tracks is not None else None
         self._persist()
         return VideoAnalysisResult(
@@ -177,11 +196,11 @@ class VideoUnderstanding:
                                strategy=plan.strategy, error=plan.error)
 
         try:
-            events, status, error = self._execute_plan(plan, record)
+            events, status, error, note = self._execute_plan(plan, record)
         except DependencyError as exc:
-            events, status, error = [], QueryStatus.failed, str(exc)
+            events, status, error, note = [], QueryStatus.failed, str(exc), None
         except Exception as exc:  # 技术错误 → failed（§42）
-            events, status, error = [], QueryStatus.failed, f"{type(exc).__name__}: {exc}"
+            events, status, error, note = [], QueryStatus.failed, f"{type(exc).__name__}: {exc}", None
 
         if events:
             record.result_refs = [e.event_uid for e in events]
@@ -197,7 +216,7 @@ class VideoUnderstanding:
         return QueryResult(
             query_id=plan.query_id, status=status, strategy=plan.strategy,
             events=events, selected_event_uids=[e.event_uid for e in selected],
-            cache_hit=False, error=error,
+            cache_hit=False, error=error, note=note,
         )
 
     def _events_for_record(self, record: AnalysisRecord) -> List[SemanticEvent]:
@@ -209,7 +228,7 @@ class VideoUnderstanding:
         )
 
     def _execute_plan(self, plan: RoutedPlan, record: AnalysisRecord):
-        """执行分析，返回 (events, status, error)。"""
+        """执行分析，返回 (events, status, error, note)。"""
         manager = self._manager
         assert manager is not None
 
@@ -231,29 +250,70 @@ class VideoUnderstanding:
         manager = self._manager
         entry = plan.entry
         if manager.tracks is None or not manager.tracks.frames:
-            return [], QueryStatus.failed, "dense spatial tracks unavailable"
+            return [], QueryStatus.failed, "dense spatial tracks unavailable", None
+
+        # ---- 可动性适配（无障碍）----
+        profile = manager.state.subject_profile
+        note = None
+        adapted_from = None
+        if len(profile.available_hands) < entry.requires_hands:
+            variant = registry.lookup(entry.single_hand_variant) if entry.single_hand_variant else None
+            if variant is not None and variant.supported and variant.detector:
+                adapted_from = entry.canonical
+                note = (f"'{entry.canonical}' 需要 {entry.requires_hands} 只可用双手，"
+                        f"单手主体降级为 '{variant.canonical}'")
+                entry = variant
+            else:
+                return [], QueryStatus.not_found, None, (
+                    f"'{entry.canonical}' 需要 {entry.requires_hands} 只可用双手，"
+                    f"主体画像仅 {profile.available_hands}；该事件对本主体不适用")
+        if profile.posture == "seated" and entry.not_seated:
+            return [], QueryStatus.not_found, None, (
+                f"'{entry.canonical}' 对坐姿主体不适用（轮椅/坐姿视频）")
+
         detector = build_detector(entry.detector)
-        ctx = DetectContext(duration=manager.state.video.duration)
+        ctx = DetectContext(duration=manager.state.video.duration, profile=profile)
         scores = detector.score(manager.tracks, ctx)
         record.model_version = f"{entry.detector}_v1"
         samples = [(s.t, s.conf) for s in scores]
         spans = detector.post_filter(aggregate(samples, entry.temporal), ctx)
+
+        # 数据覆盖度：span 内必需部位齐备的帧比例写入置信度来源；
+        # 覆盖不足时 confirmed 降为 uncertain——"缺肢体"不等于"没做动作"
+        span_sources: List[dict] = []
+        if detector.required_parts:
+            for span in spans:
+                frames_in_span = manager.tracks.between(
+                    span.temporal.start_time, span.temporal.end_time)
+                cov = (sum(1 for f in frames_in_span
+                           if parts_present(f, detector.required_parts))
+                       / len(frames_in_span)) if frames_in_span else 0.0
+                span_sources.append({"data_coverage": round(cov, 3)})
+                if cov < 0.5 and span.status == ConfidenceStatus.confirmed:
+                    span.status = ConfidenceStatus.uncertain
+        else:
+            span_sources = [{} for _ in spans]
+
         events = manager.add_events(
             entry.canonical, entry.event_type, spans,
             query_id=record.query_id,
             detector=DetectorInfo(strategy="dedicated_detector", version=record.model_version),
             extras_fn=lambda tracks, t: detector.extras_at(tracks, t),
-            confidence_sources={entry.detector: max((s.confidence for s in spans), default=0.0)},
+            span_sources=span_sources,
+            event_properties=({"adapted_from": adapted_from} if adapted_from else None),
         )
-        return events, _status_of(spans), None
+        return events, _status_of(spans), None, note
 
     # ---- pose / motion rule（§21-23）----
 
     def _run_pose_condition(self, plan: RoutedPlan, record: AnalysisRecord):
         manager = self._manager
         if manager.tracks is None or not manager.tracks.frames:
-            return [], QueryStatus.failed, "dense spatial tracks unavailable"
-        predicate = compile_condition(plan.condition)
+            return [], QueryStatus.failed, "dense spatial tracks unavailable", None
+        # 坐姿主体（轮椅入框致 person bbox 宽度失真）改用肩宽归一化
+        profile = manager.state.subject_profile
+        norm_scale = "shoulder" if profile.posture == "seated" else "person"
+        predicate = compile_condition(plan.condition, norm_scale=norm_scale)
         samples = [(f.timestamp, predicate(f)) for f in manager.tracks.frames]
         config = TemporalConfig(
             threshold=0.6, candidate_threshold=0.25,
@@ -271,9 +331,9 @@ class VideoUnderstanding:
             query_id=record.query_id,
             detector=DetectorInfo(strategy="pose_motion_rule", version=record.model_version),
             extras_fn=_condition_extras(accessor),
-            event_properties={"condition": plan.condition},
+            event_properties={"condition": plan.condition, "norm_scale": norm_scale},
         )
-        return events, _status_of(spans), None
+        return events, _status_of(spans), None, None
 
     # ---- audio（§33-35）----
 
@@ -281,7 +341,7 @@ class VideoUnderstanding:
         manager = self._manager
         analysis = self._ensure_audio(ORIGINAL_AUDIO_ASSET)
         if analysis is None:
-            return [], QueryStatus.failed, "audio analysis unavailable (no audio data or analyzer)"
+            return [], QueryStatus.failed, "audio analysis unavailable (no audio data or analyzer)", None
         canonical = plan.canonical
         if canonical == "beat":
             times = analysis.beats
@@ -290,7 +350,7 @@ class VideoUnderstanding:
         elif canonical == "music_onset":
             times = analysis.onsets[:1]
         else:
-            return [], QueryStatus.failed, f"audio event '{canonical}' not supported"
+            return [], QueryStatus.failed, f"audio event '{canonical}' not supported", None
         record.model_version = analysis.analyzer
         record.dependencies = [f"audio:{analysis.asset_id}"]
         spans = [
@@ -306,7 +366,7 @@ class VideoUnderstanding:
             detector=DetectorInfo(strategy="audio_analyzer", version=analysis.analyzer),
             confidence_sources={"audio_analysis": analysis.confidence},
         )
-        return events, _status_of(spans), None
+        return events, _status_of(spans), None, None
 
     # ---- structural（§39）----
 
@@ -332,21 +392,21 @@ class VideoUnderstanding:
                 manager.state.structural_state.first_action = ref
             if plan.canonical == "last_action":
                 manager.state.structural_state.last_action = ref
-        return events, _status_of(spans), None
+        return events, _status_of(spans), None, None
 
     # ---- open semantic（§24）----
 
     def _run_open_semantic(self, plan: RoutedPlan, record: AnalysisRecord):
         manager = self._manager
         if manager.tracks is None or not manager.tracks.frames:
-            return [], QueryStatus.failed, "dense spatial tracks unavailable"
+            return [], QueryStatus.failed, "dense spatial tracks unavailable", None
         result = detect_open_semantic(
             manager.tracks, plan.description,
             verifier=self._open_verifier, proposer=MotionEnergyProposer(),
         )
         if result.verifier_name is None:
             return [], QueryStatus.failed, \
-                "open semantic verifier not configured; candidates proposed but unverified"
+                "open semantic verifier not configured; candidates proposed but unverified", None
         spans = [
             AggregatedSpan(temporal=span, confidence=conf,
                            status=ConfidenceStatus.confirmed if conf >= 0.6 else ConfidenceStatus.uncertain)
@@ -362,14 +422,14 @@ class VideoUnderstanding:
                               "candidates": len(result.candidates)},
             confidence_sources={"open_verifier": max((c for _, c in result.verified), default=0.0)},
         )
-        return events, _status_of(spans), None
+        return events, _status_of(spans), None, None
 
     # ---- base spatial（§8/§11）----
 
     def _run_base_spatial(self, plan: RoutedPlan, record: AnalysisRecord):
         manager = self._manager
         if manager.tracks is None or not manager.tracks.frames:
-            return [], QueryStatus.failed, "dense spatial tracks unavailable"
+            return [], QueryStatus.failed, "dense spatial tracks unavailable", None
         reference = (plan.query.get("reference") or "person")
         has_target = any(
             (f.face_bbox if reference == "face" else f.person_bbox) is not None
@@ -378,8 +438,8 @@ class VideoUnderstanding:
         record.model_version = manager.tracks.producer
         record.result_refs = list(manager.state.track_artifact_ids)
         if not has_target:
-            return [], QueryStatus.not_found, None
-        return [], QueryStatus.completed, None
+            return [], QueryStatus.not_found, None, None
+        return [], QueryStatus.completed, None, None
 
     # ------------------------------------------------------------------
     # 音频入口（§52 analyze_audio / §35）
@@ -432,6 +492,13 @@ class VideoUnderstanding:
             return None
         return self._manager.state
 
+    @property
+    def tracks(self) -> Optional[DenseSpatialTracks]:
+        """Dense Analysis Data（稠密轨道本体；state 里只存 artifact 引用，§48）。"""
+        if self._manager is None:
+            return None
+        return self._manager.tracks
+
     def get_semantic_events(self, query: Optional[Union[RequiredVideoQuery, dict]] = None) -> List[SemanticEvent]:
         """读取已有语义事件；query 给出时按 canonical + occurrence 过滤。"""
         if self._manager is None:
@@ -456,11 +523,19 @@ class VideoUnderstanding:
         return self._manager.state.spatial_snapshots.get(event.spatial_ref)
 
     def get_spatial_track(self, target: str, time_range: Optional[tuple] = None) -> Optional[Trajectory]:
-        """跟头 / 跟手 / 跟人物的平滑轨迹（§9.4/§52）。"""
+        """跟头 / 跟手 / 跟人物的平滑轨迹（§9.4/§52）。
+
+        震颤主体（profile.tremor）加中值预滤波 + 更宽平滑窗。
+        """
         if self._manager is None or self._manager.tracks is None:
             return None
         accessor = _TRACK_TARGETS.get(target, target)
-        trajectory = self._manager.tracks.trajectory(accessor)
+        profile = self._manager.state.subject_profile
+        trajectory = self._manager.tracks.trajectory(
+            accessor,
+            smooth_half_window=5 if profile.tremor else 3,
+            median_prefilter=profile.tremor,
+        )
         if time_range:
             start, end = time_range
             trajectory.points = [p for p in trajectory.points if start <= p.t <= end]
