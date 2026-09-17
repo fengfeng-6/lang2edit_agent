@@ -11,7 +11,7 @@
 | 模块 | 包 | 状态 | 设计文档 |
 |---|---|---|---|
 | 一、自然语言需求理解 | `gesture_intent` | ✅ 已实现 | [docs/模块一-自然语言需求理解.md](docs/模块一-自然语言需求理解.md) |
-| 二、视频理解 | `video_understanding` | 📄 设计完成，包骨架已建 | [docs/模块二-视频理解.md](docs/模块二-视频理解.md) |
+| 二、视频理解 | `video_understanding` | ✅ 已实现（核心链路 + 规则检测器；CV/音频重模型为可选适配器） | [docs/模块二-视频理解.md](docs/模块二-视频理解.md) |
 | 三、剪辑规划 | `editing_planner`（预留名） | 未开始 | — |
 | 四、素材搜索与管理 | `asset_manager`（预留名） | 未开始 | — |
 | 五、剪辑工具执行 | `edit_executor`（预留名） | 未开始 | — |
@@ -29,7 +29,7 @@
 ├── examples/              # 示例输入（request.json 等）
 ├── src/
 │   ├── gesture_intent/        # 模块一：自然语言需求理解
-│   └── video_understanding/   # 模块二：视频理解（骨架，按 docs/模块二 §5 六能力划分子包）
+│   └── video_understanding/   # 模块二：视频理解（按 docs/模块二 §5 六能力划分子包）
 ├── tests/
 │   └── intent/            # 各模块测试按短名分目录（intent/、video/…），文件 basename 保持全局唯一
 ├── data/                  # 素材/分析缓存（gitignore）
@@ -157,19 +157,94 @@ updated = IntentStateManager().apply_patch(current, patch)
 将用户语言中的动作、手势、姿态、视频结构和音乐节点映射为带 What / When / Where
 的语义事件（如"第 2 次比心：start 9.82s / peak 10.35s / end 10.91s"）。
 
-当前为包骨架，子包按设计文档 §5 的六能力划分：
+**核心链路纯标准库 + Pydantic**（查询路由、时间聚合、规则检测器、语义状态、
+缓存覆盖、失效管理、Semantic View 全部可离线运行）；重模型依赖
+（MediaPipe 关键点 / PyAV 解码 / librosa 节奏）以可选 extras 懒加载，
+缺失时相关查询记 `failed`（技术错误），与 `not_found`（正常分析但无目标）严格区分（§42）。
+
+### 架构
 
 ```
-video_understanding/
-  preprocessing/   视频预处理、metadata、source timeline
-  spatial/         人物与空间理解、空间原语、dense tracks
-  pose/            Pose/手部表征、规则引擎、条件编译
-  events/          语义事件检测：策略路由、检测器、时间聚合、registry
-  audio/           音频与节奏：BPM / beat / downbeat
-  state/           Semantic Video State、查询缓存、失效管理、Semantic View
-  models.py        数据模型（占位）
-  api.py           对外接口（占位，§52 八个接口）
+api.py            VideoUnderstanding 门面（§52 八个接口）
+    │
+preprocessing/    metadata.py   ffprobe / 注入两级降级的元数据（§6）
+    │
+spatial/          loaders.py    DenseSpatialTracks JSON artifact 加载（§48）
+                  snapshot.py   事件快照 / Event Anchor / Protected Region（§27-29）
+                  mediapipe_backend.py  MediaPipe+PyAV 真实视频后端（可选）
+    │
+pose/             conditions.py 条件编译：above/near/crossed/left_of/right_of（§21-23）
+                  motion.py     位移/速度/运动能量（§22）
+    │
+events/           router.py     策略路由：dedicated → pose_rule → open_semantic（§14）
+                  registry.py   事件注册表：能力 + 事件级 temporal_config（§20/§26）
+                  detectors.py  姿态启发式打分器（heart/point/wave/open/close/
+                                turn/move/jump/squat/ending_pose…）
+                  aggregator.py 平滑→阈值→分段→缺口合并→最小时长→peak（§19）
+                  structural.py video_start/end、first/last_action（§39）
+                  open_semantic.py  运动能量提案 + 可插拔 verifier（§24）
+    │
+audio/            analyzer.py   BPM/beat/downbeat/onset（§33-35，§34 统一协议）
+    │
+state/            manager.py    事件物化：event_uid/display_id/occurrence（§37-38）
+                  cache.py      Query Coverage：all ⊇ index/first/last/range（§45-46）
+                  view.py       SemanticViewBuilder（§49）
+                  store.py      state.json + analysis_artifacts/ 分离落盘（§48/§50-51）
 ```
+
+### 事件覆盖（MVP §59）
+
+- **手势**：heart_gesture、point_left/right、wave_hand、open/close_both_hands；
+  thumbs_up/v_sign/ok_sign 已注册，依赖 hand landmarks 轨道（按需 §11）。
+- **身体动作**：turn_body、move_left/right、jump、squat、stand_up、lean_body、
+  approach_camera、ending_pose。
+- **Pose Condition**：above/below/near/crossed/left_of/right_of + min_duration。
+- **音频**：bpm、beat、downbeat、music_onset（chorus_start 已注册未实现）。
+- **结构**：video_start/end、first_action、last_action。
+- **开放语义**：运动能量提案 + 注入式 verifier；未配置 verifier 时 `failed`。
+
+### 用法
+
+```python
+from video_understanding import VideoUnderstanding
+
+vu = VideoUnderstanding()
+vu.analyze_video({
+    "video_id": "v1",
+    "metadata": {"duration": 14.82, "fps": 30, "resolution": [1080, 1920]},
+    "tracks": {...},   # 稠密轨道 artifact；真实视频路径则走 MediaPipe 后端
+    "audio": {"original_audio": {"bpm": 126, "beats": [...], "downbeats": [...]}},
+})
+results = vu.resolve_queries([
+    {"type": "event_detection", "event": "heart_gesture",
+     "required_occurrence": {"type": "index", "value": 2}},
+])
+snap = vu.get_spatial_snapshot(results[0].selected_event_uids[0])
+traj = vu.get_spatial_track("head")                      # 平滑轨迹（§9.4）
+view = vu.build_semantic_view()                          # 交付 Planner 的精简视图
+vu.invalidate({"type": "dependency", "name": "pose_track"})  # §47 失效
+```
+
+```powershell
+# CLI：演示输入（脚本化合成轨道，无 CV 依赖也可跑通）
+python examples/make_demo_input.py > examples/demo_input.json
+video-understand run --input examples/demo_input.json --pretty
+video-understand view --workspace <落盘目录>
+```
+
+### 真实视频路径（可选）
+
+```powershell
+python -m pip install -e ".[video]"   # av + mediapipe + librosa + scipy
+python -m pip install -e ".[audio]"   # 可选：beat_this 真实 downbeat（拉 torch）
+python scripts/download_models.py     # MediaPipe .task 模型 → data/models/
+```
+
+| 环境变量 | 说明 | 默认 |
+|---|---|---|
+| `VU_MODEL_DIR` | MediaPipe 模型目录 | `data/models` |
+| `VU_WORKSPACE_DIR` | 语义状态/产物工作目录 | `workspace` |
+| `VU_TEST_VIDEO` | 集成测试用手势舞视频 | `data/test_video.mp4` |
 
 MVP 范围与验收标准见 [docs/模块二-视频理解.md](docs/模块二-视频理解.md) §59-61。
 
@@ -184,6 +259,12 @@ python -m pytest
 覆盖（模块一）：初始请求拆分、发生次数（首次/末次/每次/第 N 次/范围）、
 时态关系（前/时/过程/后）、姿态与音频事件查询、引用解析与未解析、
 冲突检测、LLM 失败回退、OpenAI 适配器、状态应用、JSON 存储往返、CLI 往返。
+
+覆盖（模块二，`tests/video/`）：时间聚合器（平滑/缺口合并/最小时长/peak）、
+条件编译（above/near/crossed/left_of/right_of）、规则检测器（比心两次发生、
+指向左右方向、ending_pose、landmark 依赖）、缓存覆盖与增量分析、
+not_found/failed 区分、空间快照与轨迹、音频事件物化、结构化事件、
+失效管理（依赖/视频/裁剪）、状态持久化往返、CLI 往返、模块一查询对接。
 
 新增模块的测试放在 `tests/<模块短名>/` 下（如 `tests/video/`），
 各目录内测试文件 basename 需全局唯一（pytest prepend 导入模式要求）。
