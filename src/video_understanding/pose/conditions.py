@@ -14,13 +14,20 @@ from __future__ import annotations
 from typing import Callable, List, Optional, Tuple
 
 from ..models import FrameObservation, Point2
-from ..spatial.snapshot import normalized_distance
+from ..spatial.snapshot import normalized_distance, spatial_scale
 
-# 关系缺省阈值（归一化坐标 / 人物宽度归一化距离）
-DEFAULT_ABOVE_DELTA = 0.04
-DEFAULT_NEAR_DELTA = 0.55  # 单位：person 宽度（手贴脸约 0.2–0.4）
-DEFAULT_SIDE_DELTA = 0.03
+# 关系缺省阈值（躯干尺度归一化，§21 d_norm；真实视频校准值。
+# torso=肩髋中点距离，不随手臂张合变化——person bbox 含张开的手臂时
+# 宽度虚高会把"贴脸"误判为常态）。
+DEFAULT_ABOVE_DELTA = 0.08   # above/below/left/right 的饱和间隔：gap=d 得满分
+DEFAULT_NEAR_DELTA = 0.7     # "靠近"：得分 >0 要求 dist < 0.7 躯干尺度
+DEFAULT_SIDE_DELTA = 0.08
 DEFAULT_CROSS_MAX_DIST = 0.9
+
+
+def _norm_gap(frame: FrameObservation, gap: float) -> float:
+    """单向 gap（dx/dy）按躯干尺度归一。"""
+    return gap / spatial_scale(frame, "torso")
 
 
 def _subject_points(frame: FrameObservation, subject: str) -> List[Tuple[str, Point2]]:
@@ -68,8 +75,9 @@ def compile_condition(condition: dict, norm_scale: str = "person") -> Callable[[
     """结构化条件 → 单帧评分谓词（0..1）。
 
     支持 relation：above / below / left_of / right_of / near / crossed。
-    条件可带 ``delta`` 覆盖默认阈值；``min_duration`` 由聚合层读取。
-    ``norm_scale="shoulder"`` 用于坐姿主体（person bbox 含轮椅会失真）。
+    条件可带 ``delta`` 覆盖默认阈值（躯干尺度单位）；``min_duration``
+    由聚合层读取。手-身距离（near/方向关系）按 torso 尺度归一，
+    ``norm_scale="shoulder"`` 仅影响 crossed 的参考点距离（坐姿主体用）。
     """
     subject = condition.get("subject", "hand")
     relation = condition.get("relation", "near")
@@ -77,21 +85,23 @@ def compile_condition(condition: dict, norm_scale: str = "person") -> Callable[[
     delta = float(condition.get("delta") or 0.0)
 
     def _score_pair(a: Point2, b: Point2, frame: FrameObservation) -> float:
+        # 方向关系按 gap/delta 渐变打分（gap=d 得满分）：二值判定会把
+        # "刚好过线"的真实命中整段漏掉（真实视频校准）。
         if relation == "above":
             d = delta or DEFAULT_ABOVE_DELTA
-            return 1.0 if a[1] < b[1] - d else 0.0
+            return min(1.0, max(0.0, _norm_gap(frame, b[1] - a[1]) / d))
         if relation == "below":
             d = delta or DEFAULT_ABOVE_DELTA
-            return 1.0 if a[1] > b[1] + d else 0.0
+            return min(1.0, max(0.0, _norm_gap(frame, a[1] - b[1]) / d))
         if relation == "left_of":
             d = delta or DEFAULT_SIDE_DELTA
-            return 1.0 if a[0] < b[0] - d else 0.0
+            return min(1.0, max(0.0, _norm_gap(frame, b[0] - a[0]) / d))
         if relation == "right_of":
             d = delta or DEFAULT_SIDE_DELTA
-            return 1.0 if a[0] > b[0] + d else 0.0
+            return min(1.0, max(0.0, _norm_gap(frame, a[0] - b[0]) / d))
         if relation in ("near", "beside", "close_to"):
             d = delta or DEFAULT_NEAR_DELTA
-            dist = normalized_distance(a, b, frame, scale_mode=norm_scale)
+            dist = normalized_distance(a, b, frame, scale_mode="torso")
             return max(0.0, 1.0 - dist / d)
         return 0.0
 

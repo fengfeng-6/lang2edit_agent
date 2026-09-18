@@ -86,6 +86,13 @@ class SemanticStateManager:
         artifact_id = tracks.artifact_id or f"{tracks.producer or 'tracks'}_{tracks.video_id}"
         tracks.artifact_id = artifact_id
         self.tracks = tracks
+        n = len(tracks.frames)
+        present = sum(1 for f in tracks.frames if f.person_bbox or f.keypoints)
+        self.state.spatial_summary = {
+            "frames": n,
+            "person_present_ratio": round(present / n, 3) if n else 0.0,
+            "has_hand_landmarks": any(f.hands for f in tracks.frames),
+        }
         if artifact_id not in self.state.track_artifact_ids:
             self.state.track_artifact_ids.append(artifact_id)
             self.state.version += 1
@@ -120,7 +127,15 @@ class SemanticStateManager:
         confidence_sources: Optional[Dict[str, float]] = None,
         span_sources: Optional[List[Dict[str, float]]] = None,
     ) -> List[SemanticEvent]:
-        """候选区间 → SemanticEvent 入库：分配 uid、快照、occurrence 编号。"""
+        """候选区间 → SemanticEvent 入库：分配 uid、快照、occurrence 编号。
+
+        同一 canonical 的检测是对全时间轴的整体重算——新结果入库前，
+        该 canonical 现存的（未被取代的）旧事件整体标记 ``invalidated``
+        （软删除留痕，§47），避免重检后新旧结果并存成重复事件。
+        """
+        for event in self.state.semantic_events:
+            if event.canonical == canonical and not event.invalidated:
+                event.invalidated = True
         created: List[SemanticEvent] = []
         for i, span in enumerate(spans):
             uid = event_uid_for(
@@ -129,6 +144,7 @@ class SemanticStateManager:
             )
             existing = next((e for e in self.state.semantic_events if e.event_uid == uid), None)
             if existing is not None:
+                existing.invalidated = False  # 重检同 uid：刚被取代标记的旧事件复活
                 if query_id not in existing.source_query_ids:
                     existing.source_query_ids.append(query_id)
                 created.append(existing)
@@ -160,10 +176,11 @@ class SemanticStateManager:
         return created
 
     def _renumber(self) -> None:
-        """按 source time 重排同 canonical 事件，更新 occurrence_index/display_id。"""
+        """按 source time 重排同 canonical 有效事件，更新 occurrence_index/display_id。"""
         by_canonical: Dict[str, List[SemanticEvent]] = {}
         for event in self.state.semantic_events:
-            by_canonical.setdefault(event.canonical, []).append(event)
+            if not event.invalidated:
+                by_canonical.setdefault(event.canonical, []).append(event)
         for canonical, group in by_canonical.items():
             group.sort(key=lambda e: (e.temporal.start_time, e.temporal.peak_time))
             for i, event in enumerate(group, start=1):
@@ -196,6 +213,8 @@ class SemanticStateManager:
         from .cache import query_covers
 
         for record in self.state.analysis_registry:
+            if record.validity != "valid":
+                continue
             if record.status not in (QueryStatus.completed, QueryStatus.not_found, QueryStatus.low_confidence):
                 continue
             if query_covers(record.query, query):
@@ -203,25 +222,39 @@ class SemanticStateManager:
         return None
 
     def invalidate(self, dependency: dict) -> dict:
-        """分析结果失效（§47）。
+        """分析结果失效（§47）三级语义。
 
-        - ``{"type": "video"}``：源视频替换 → 全部记录与事件失效；
-        - ``{"type": "model", "name": x}`` / ``{"type": "dependency", "name": x}``：
-          命中 model_version / dependencies 的记录失效；
+        - ``{"type": "model", "name": x}``：模型/检测器版本升级 → 命中记录标
+          ``stale``——结果与事件保留可见，但不再覆盖新查询（下次查询重算，
+          由同 canonical 取代机制换新）；
+        - ``{"type": "dependency", "name": x}`` / ``{"type": "video"}``：
+          依赖产物失效 / 源视频替换 → 记录 invalidated + 事件 invalidated；
+        - ``{"type": "query", "name"|"query_id": x}``：单条查询记录失效；
         - ``{"type": "edit"}``：工程裁剪 → 语义状态不失效（§47.2，no-op）。
         """
         dtype = dependency.get("type", "")
-        name = dependency.get("name") or dependency.get("model") or ""
+        name = dependency.get("name") or dependency.get("model") or dependency.get("query_id") or ""
         if dtype == "edit":
             return {"invalidated_queries": 0, "invalidated_events": 0, "no_op": True}
+
+        if dtype == "model":
+            stale = [
+                r for r in self.state.analysis_registry
+                if r.validity == "valid" and name and name in (r.model_version or "")
+            ]
+            for record in stale:
+                record.validity = "stale"  # 仅标陈：status 与事件保留
+            if stale:
+                self.state.version += 1
+            return {"stale_queries": len(stale), "invalidated_events": 0, "no_op": False}
 
         def hit(record: AnalysisRecord) -> bool:
             if dtype == "video":
                 return True
-            if dtype == "model":
-                return bool(name) and name in (record.model_version or "")
             if dtype == "dependency":
                 return name in record.dependencies
+            if dtype == "query":
+                return record.query_id == name
             return False
 
         affected_queries = [
@@ -236,6 +269,7 @@ class SemanticStateManager:
                 n_events += 1
         for record in affected_queries:
             record.status = QueryStatus.invalidated
+            record.validity = "invalidated"
         if affected_queries:
             self.state.version += 1
         return {

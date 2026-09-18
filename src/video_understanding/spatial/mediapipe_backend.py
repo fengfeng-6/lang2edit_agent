@@ -59,20 +59,25 @@ def _default_model_dir() -> Path:
     return Path(os.environ.get("VU_MODEL_DIR", "data/models"))
 
 
+_ROTATE_K = {0: 0, 90: 3, 180: 2, 270: 1}  # 容器 rotate=N（顺时针）→ np.rot90 逆时针 4-N 次转正
+
+
 class MediaPipeSpatialAnalyzer:
     """Base Spatial Analysis 的默认真实实现（§8/§11）。
 
     ``with_hands=True`` 时同时跑 HandLandmarker，输出 21 点 landmarks
-    （on-demand 精细手部分析）。
+    （on-demand 精细手部分析）。``max_side`` 限制送入模型的最长边
+    （长边缩放到该值再推理，提速不改归一化坐标语义）。
     """
 
     name = "mediapipe_v1"
 
     def __init__(self, model_dir: Optional[Path] = None, *, with_hands: bool = False,
-                 sample_fps: float = 15.0):
+                 sample_fps: float = 15.0, max_side: Optional[int] = None):
         self.model_dir = Path(model_dir) if model_dir else _default_model_dir()
         self.with_hands = with_hands
         self.sample_fps = sample_fps  # 抽帧分析帧率（§6.2 视频抽帧）
+        self.max_side = max_side
 
     def available(self) -> bool:
         import importlib.util
@@ -88,11 +93,22 @@ class MediaPipeSpatialAnalyzer:
             fps = video.fps
         elif isinstance(video, dict):
             path = video.get("path") or video.get("source_uri")
-            video_id = video.get("video_id", "video")
-            fps = float(video.get("metadata", {}).get("fps", 30.0))
+            video_id = video.get("video_id")
+            if not video_id and path:
+                from ..preprocessing.metadata import video_id_for
+                try:
+                    video_id = video_id_for(path)
+                except OSError:
+                    video_id = None
+            video_id = video_id or "video"
+            fps = float((video.get("metadata") or {}).get("fps", 30.0))
         else:
             path = str(video)
-            video_id = Path(path).stem
+            from ..preprocessing.metadata import video_id_for
+            try:
+                video_id = video_id_for(path)
+            except OSError:
+                video_id = Path(path).stem
             fps = 30.0
         if not path:
             raise RuntimeError("mediapipe analyzer requires a video file path")
@@ -100,6 +116,7 @@ class MediaPipeSpatialAnalyzer:
         try:
             import av
             import mediapipe as mp
+            import numpy as np
             from mediapipe.tasks import python as mp_python
             from mediapipe.tasks.python import vision as mp_vision
         except ImportError as exc:
@@ -141,19 +158,43 @@ class MediaPipeSpatialAnalyzer:
 
         frames = []
         step = max(1, round(fps / self.sample_fps))
+        # VIDEO 模式要求检测时间戳严格递增：pts 异常（重复/回退）时兜底单调化
+        last_ts_ms = -1
         try:
             container = av.open(path)
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
+            from ..preprocessing.metadata import _rotation_degrees
+            meta_rotation = 0
+            if isinstance(video, VideoMetadata):
+                meta_rotation = int(video.rotation or 0)
+            elif isinstance(video, dict):
+                try:
+                    meta_rotation = int((video.get("metadata") or {}).get("rotation") or 0)
+                except (TypeError, ValueError):
+                    meta_rotation = 0
+            rot_k = _ROTATE_K.get(_rotation_degrees(stream, fallback=meta_rotation) % 360, 0)
             index = -1
             for av_frame in container.decode(stream):
                 index += 1
                 if index % step:
                     continue
                 timestamp = float(av_frame.pts * av_frame.time_base) if av_frame.pts is not None else index / fps
+                if self.max_side:
+                    w0, h0 = av_frame.width, av_frame.height
+                    scale = self.max_side / max(w0, h0)
+                    if scale < 1.0:
+                        av_frame = av_frame.reformat(
+                            max(2, int(round(w0 * scale / 2)) * 2),
+                            max(2, int(round(h0 * scale / 2)) * 2),
+                            "rgb24",
+                        )
                 image = av_frame.to_ndarray(format="rgb24")
+                if rot_k:  # 容器旋转归一：下游坐标系基于转正后的画面
+                    image = np.ascontiguousarray(np.rot90(image, rot_k))
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
-                ts_ms = int(timestamp * 1000)
+                ts_ms = max(int(timestamp * 1000), last_ts_ms + 1)
+                last_ts_ms = ts_ms
 
                 pose_result = pose.detect_for_video(mp_image, ts_ms)
                 keypoints = {}

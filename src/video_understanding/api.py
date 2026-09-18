@@ -27,7 +27,12 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 from gesture_intent.models import RequiredVideoQuery, model_validate
 
-from .audio.analyzer import AudioAnalyzer, LibrosaAudioAnalyzer, ProvidedAudioAnalyzer
+from .audio.analyzer import (
+    AudioAnalyzer,
+    LibrosaAudioAnalyzer,
+    ProvidedAudioAnalyzer,
+    default_audio_analyzer,
+)
 from .events.aggregator import AggregatedSpan, TemporalConfig, aggregate
 from .events.detectors import (
     DependencyError,
@@ -37,7 +42,7 @@ from .events.detectors import (
 )
 from .events import registry
 from .events.open_semantic import MotionEnergyProposer, OpenSemanticVerifier, detect_open_semantic
-from .events.router import RoutedPlan, normalize_query, route
+from .events.router import RoutedPlan, normalize_query, query_id_for, route
 from .events.structural import resolve_structural
 from .models import (
     AnalysisRecord,
@@ -66,7 +71,7 @@ from .spatial.profile import infer_mobility_profile, mirror_tracks
 from .state.cache import select_by_occurrence
 from .state.manager import SemanticStateManager
 from .state.store import SemanticStateStore
-from .state.view import build_semantic_view
+from .state.view import build_semantic_view, to_intent_view
 
 ORIGINAL_AUDIO_ASSET = "original_audio"
 
@@ -92,6 +97,7 @@ class VideoUnderstanding:
         self._manager: Optional[SemanticStateManager] = None
         self._store = SemanticStateStore(workspace_dir) if workspace_dir else None
         self._audio_inputs: Dict[str, Any] = {}  # asset_id → 提供方数据/路径
+        self._video_input: Any = None  # analyze_video 的原始输入（on-demand 手部轨道用）
 
     # ------------------------------------------------------------------
     # §52 analyze_video
@@ -107,6 +113,7 @@ class VideoUnderstanding:
         metadata = resolve_metadata(video)
         manager = SemanticStateManager(metadata)
         self._manager = manager
+        self._video_input = video  # on-demand 手部轨道重跑要用
         warnings: List[str] = []
 
         declared_profile = None
@@ -158,7 +165,17 @@ class VideoUnderstanding:
     def resolve_queries(self, queries: Iterable[Union[RequiredVideoQuery, dict]]) -> List[QueryResult]:
         if self._manager is None:
             raise RuntimeError("call analyze_video() first")
-        return [self._resolve_one(q) for q in queries]
+        # 相同归一化查询去重（保持输入 arity：重复查询复用同一结果）
+        results: Dict[str, QueryResult] = {}
+        out: List[QueryResult] = []
+        for query in queries:
+            qid = query_id_for(normalize_query(query))
+            cached = results.get(qid)
+            if cached is None:
+                cached = self._resolve_one(query)
+                results[cached.query_id] = cached
+            out.append(cached)
+        return out
 
     def _resolve_one(self, query: Union[RequiredVideoQuery, dict]) -> QueryResult:
         plan = route(query)
@@ -175,6 +192,20 @@ class VideoUnderstanding:
             if covering.status == QueryStatus.completed and not selected \
                     and covering.strategy != "base_spatial":
                 status = QueryStatus.not_found
+            # 缓存命中也算"该查询消费了这些事件"：补记 qid 进
+            # source_query_ids（build_view 按 query_ids 过滤时不漏，§49），
+            # 并登记轻量记录让 query_statuses / history 完整。
+            for evt in events:
+                if plan.query_id not in evt.source_query_ids:
+                    evt.source_query_ids.append(plan.query_id)
+            if not any(r.query_id == plan.query_id for r in manager.state.analysis_registry):
+                manager.record_query(AnalysisRecord(
+                    query_id=plan.query_id, query=data, status=status,
+                    result_refs=[e.event_uid for e in selected],
+                    strategy=covering.strategy,
+                    source_video_version=covering.source_video_version,
+                    dependencies=[],
+                ))
             return QueryResult(
                 query_id=plan.query_id, status=status, strategy=covering.strategy,
                 events=selected, selected_event_uids=[e.event_uid for e in selected],
@@ -198,7 +229,15 @@ class VideoUnderstanding:
         try:
             events, status, error, note = self._execute_plan(plan, record)
         except DependencyError as exc:
-            events, status, error, note = [], QueryStatus.failed, str(exc), None
+            # 手部关键点按需补跑（§11 on-demand）：landmark 系查询不预先
+            # 要求 with_hands——轨道缺手部数据时尝试重跑一遍手部检测再重试。
+            if "hand landmark" in str(exc) and self._ensure_hands():
+                try:
+                    events, status, error, note = self._execute_plan(plan, record)
+                except Exception as retry_exc:
+                    events, status, error, note = [], QueryStatus.failed, f"{type(retry_exc).__name__}: {retry_exc}", None
+            else:
+                events, status, error, note = [], QueryStatus.failed, str(exc), None
         except Exception as exc:  # 技术错误 → failed（§42）
             events, status, error, note = [], QueryStatus.failed, f"{type(exc).__name__}: {exc}", None
 
@@ -226,6 +265,46 @@ class VideoUnderstanding:
             (e for e in state.semantic_events if e.event_uid in wanted and not e.invalidated),
             key=lambda e: (e.temporal.start_time, e.canonical),
         )
+
+    def _ensure_hands(self) -> bool:
+        """按需手部轨道补跑（§11 on-demand 精细手部）。
+
+        landmark 系查询命中 DependencyError 时调用：空间分析器支持
+        ``with_hands`` 则以手部模式重跑一遍并把 hands 观测合并进现有
+        轨道（同采样率帧对齐），成功后调用方可重试检测。
+        """
+        manager = self._manager
+        tracks = manager.tracks if manager else None
+        if tracks is None or self._video_input is None:
+            return False
+        if any(f.hands for f in tracks.frames):
+            return True  # 已有手部数据
+        analyzer = self._spatial_analyzer
+        if analyzer is None or not hasattr(analyzer, "with_hands"):
+            return False
+        try:
+            import copy
+
+            hands_analyzer = copy.copy(analyzer)
+            hands_analyzer.with_hands = True
+            new_tracks = hands_analyzer.analyze(self._video_input)
+        except Exception:
+            return False
+        if new_tracks is None or not any(f.hands for f in new_tracks.frames):
+            return False
+        # 帧对齐合并：同采样参数下帧序一致；否则按时间戳对齐
+        if len(new_tracks.frames) == len(tracks.frames):
+            for dst, src in zip(tracks.frames, new_tracks.frames):
+                if src.hands:
+                    dst.hands = src.hands
+        else:
+            by_t = {round(f.timestamp, 3): f for f in new_tracks.frames}
+            for frame in tracks.frames:
+                src = by_t.get(round(frame.timestamp, 3))
+                if src and src.hands:
+                    frame.hands = src.hands
+        manager.state.spatial_summary["has_hand_landmarks"] = True
+        return any(f.hands for f in tracks.frames)
 
     def _execute_plan(self, plan: RoutedPlan, record: AnalysisRecord):
         """执行分析，返回 (events, status, error, note)。"""
@@ -315,10 +394,12 @@ class VideoUnderstanding:
         norm_scale = "shoulder" if profile.posture == "seated" else "person"
         predicate = compile_condition(plan.condition, norm_scale=norm_scale)
         samples = [(f.timestamp, predicate(f)) for f in manager.tracks.frames]
+        # 条件命中（举手、贴脸）在舞蹈里常只有零点几秒：阈值/时长放宽
+        # 后渐变打分段的短命中才不被吃掉（真实视频校准值）。
         config = TemporalConfig(
-            threshold=0.6, candidate_threshold=0.25,
-            min_duration=condition_min_duration(plan.condition, 0.2),
-            merge_gap=0.15, smooth_half_window=1,
+            threshold=0.4, candidate_threshold=0.25,
+            min_duration=condition_min_duration(plan.condition, 0.12),
+            merge_gap=0.25, smooth_half_window=1,
         )
         spans = aggregate(samples, config)
         canonical = _pose_condition_canonical(plan.condition)
@@ -458,10 +539,10 @@ class VideoUnderstanding:
             if isinstance(payload, (dict, AudioAnalysis)):
                 analysis = ProvidedAudioAnalyzer(payload).analyze(asset)
             else:  # payload 是文件路径等非结构化输入 → 交给真实分析器
-                analyzer = self._audio_analyzer or LibrosaAudioAnalyzer()
+                analyzer = self._audio_analyzer or default_audio_analyzer()
                 analysis = analyzer.analyze(payload)
         else:
-            analyzer = self._audio_analyzer or LibrosaAudioAnalyzer()
+            analyzer = self._audio_analyzer or default_audio_analyzer()
             analysis = analyzer.analyze(asset)
         self._manager.state.audio_state[analysis.asset_id] = analysis
         self._manager.state.version += 1
@@ -541,10 +622,17 @@ class VideoUnderstanding:
             trajectory.points = [p for p in trajectory.points if start <= p.t <= end]
         return trajectory
 
-    def build_semantic_view(self, context: Optional[dict] = None) -> SemanticView:
-        """context: {queries, event_uids, include_audio}（§49）。"""
+    def build_semantic_view(self, context: Optional[dict] = None, *,
+                            as_intent_view: bool = False):
+        """context: {queries, event_uids, include_audio}（§49）。
+
+        ``as_intent_view=True`` 时返回模块一 ``SemanticVideoView``
+        （IntentParserInput.semantic_video_view 可直接消费）。
+        """
         if self._manager is None:
             raise RuntimeError("call analyze_video() first")
+        if as_intent_view:
+            return to_intent_view(self._manager.state)
         context = context or {}
         return build_semantic_view(
             self._manager.state,

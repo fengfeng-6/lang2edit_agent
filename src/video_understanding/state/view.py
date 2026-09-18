@@ -17,6 +17,32 @@ from ..models import (
 )
 
 
+def to_intent_view(state: SemanticVideoState):
+    """导出模块一 ``SemanticVideoView``（IntentParserInput.semantic_video_view）。
+
+    多轮意图解析把当前视频事件以精简形式喂回 Parser——只保留有效事件，
+    按 source time 排序，event_id 用稳定 event_uid。
+    """
+    from gesture_intent.models import SemanticVideoEvent, SemanticVideoView
+
+    events = [
+        SemanticVideoEvent(
+            event_id=e.event_uid,
+            event_type=e.event_type,
+            canonical=e.canonical,
+            start_time=e.temporal.start_time,
+            peak_time=e.temporal.peak_time,
+            end_time=e.temporal.end_time,
+            confidence=e.confidence.overall,
+        )
+        for e in sorted(
+            (e for e in state.semantic_events if not e.invalidated),
+            key=lambda e: e.temporal.start_time,
+        )
+    ]
+    return SemanticVideoView(events=events)
+
+
 def _event_brief(event: SemanticEvent) -> Dict[str, Any]:
     return {
         "event_uid": event.event_uid,
@@ -126,6 +152,9 @@ def build_semantic_view(
             "aspect_ratio": video.aspect_ratio,
             "has_audio": video.has_audio,
             "version": video.version,
+            **{k: state.spatial_summary[k] for k in
+               ("person_present_ratio", "frames", "has_hand_landmarks")
+               if k in state.spatial_summary},
         },
         relevant_events=[_event_brief(e) for e in events],
         spatial_summaries=spatial_summaries,

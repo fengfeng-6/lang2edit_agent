@@ -29,7 +29,7 @@ def test_hand_above_head():
 
 def test_hand_near_face_uses_person_normalized_distance():
     pred = compile_condition({"subject": "hand", "relation": "near", "reference": "face"})
-    near = pred(_frame(lw=(0.40, 0.20)))
+    near = pred(_frame(lw=(0.44, 0.19)))  # 手贴在脸侧（face bbox 内缘）
     far = pred(_frame())
     assert near > far > 0.0 or (near > 0 and far == 0.0)
     assert near >= 0.5

@@ -66,27 +66,44 @@ def build_snapshot(
     )
 
 
-def normalized_distance(a: Point2, b: Point2, frame: FrameObservation,
-                        scale_mode: str = "person") -> float:
-    """两点距离归一化（§21 的 d_norm）。
+def spatial_scale(frame: FrameObservation, scale_mode: str = "person") -> float:
+    """归一化分母（§21 d_norm 的尺度基准）。
 
-    - ``person``：||p_a - p_b|| / w_person（默认，person bbox 宽度）；
-    - ``shoulder``：肩宽 × 2.5 作为人体宽度等效——坐姿主体（轮椅入框
-      使 person bbox 失真）或上半身构图下更稳定。
+    - ``torso``：肩髋中点距离（躯干长）——不随手臂张合变化，
+      是"近脸/举手"这类手-身距条件最稳定的尺度；髋不可见时退化
+      shoulder → person。
+    - ``shoulder``：肩宽 × 2.5 的人体宽度等效（坐姿主体用）。
+    - ``person``：person bbox 宽度（默认）。
     """
-    import math
-
-    dist = math.hypot(a[0] - b[0], a[1] - b[1])
+    if scale_mode == "torso":
+        sh_y = _mid_y(frame, "left_shoulder", "right_shoulder")
+        hip_y = _mid_y(frame, "left_hip", "right_hip")
+        if sh_y is not None and hip_y is not None and hip_y - sh_y > 1e-4:
+            return hip_y - sh_y
+        scale_mode = "shoulder"  # 髋不可见退化
     if scale_mode == "shoulder":
         sw = shoulder_width(frame)
         if sw and sw > 1e-4:
-            return dist / (sw * 2.5)
-        # 肩不可见时退化到 person 宽
+            return sw * 2.5
     if frame.person_bbox:
         width = frame.person_bbox[2] - frame.person_bbox[0]
         if width > 1e-6:
-            return dist / width
-    return dist
+            return width
+    return 1.0
+
+
+def _mid_y(frame: FrameObservation, left_name: str, right_name: str) -> Optional[float]:
+    ys = [p[1] for n in (left_name, right_name)
+          if (p := frame.keypoints.get(n)) is not None]
+    return sum(ys) / len(ys) if ys else None
+
+
+def normalized_distance(a: Point2, b: Point2, frame: FrameObservation,
+                        scale_mode: str = "person") -> float:
+    """两点距离归一化（§21 的 d_norm），分母见 ``spatial_scale``。"""
+    import math
+
+    return math.hypot(a[0] - b[0], a[1] - b[1]) / spatial_scale(frame, scale_mode)
 
 
 def shoulder_width(frame: FrameObservation) -> Optional[float]:
