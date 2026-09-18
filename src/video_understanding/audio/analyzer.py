@@ -61,6 +61,33 @@ def _validate_audio(data: dict) -> AudioAnalysis:
     return model_validate(AudioAnalysis, data)
 
 
+def _load_pcm(librosa, path: str):
+    """加载为 mono PCM：先走 librosa（wav/flac 经 soundfile，mp3 经
+    audioread），失败时退化 PyAV 解码——mp4/m4a 等容器在无 ffmpeg CLI
+    的环境下只有后者可靠。"""
+    try:
+        return librosa.load(path, sr=None, mono=True)
+    except Exception:
+        import av  # 同属 [video] extras，装了 librosa 的语义环境一般也有 av
+
+        chunks = []
+        with av.open(path) as container:
+            if not container.streams.audio:
+                raise RuntimeError(f"no audio stream in {path}")
+            stream = container.streams.audio[0]
+            resampler = av.AudioResampler(format="flt", layout="mono", rate=22050)
+            for frame in container.decode(stream):
+                for out in resampler.resample(frame):
+                    chunks.append(out.to_ndarray()[0])
+            for out in resampler.resample(None):  # flush
+                chunks.append(out.to_ndarray()[0])
+        if not chunks:
+            raise RuntimeError(f"empty audio stream in {path}")
+        import numpy as np
+
+        return np.concatenate(chunks).astype(np.float32), 22050
+
+
 class LibrosaAudioAnalyzer:
     """librosa 节奏分析（可选依赖；未安装时 available()=False）。"""
 
@@ -90,7 +117,7 @@ class LibrosaAudioAnalyzer:
         if not path:
             raise RuntimeError("audio analysis requires a file path or provided data")
 
-        y, sr = librosa.load(path, sr=None, mono=True)
+        y, sr = _load_pcm(librosa, path)
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
         tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
         beats = [float(t) for t in librosa.frames_to_time(beat_frames, sr=sr)]

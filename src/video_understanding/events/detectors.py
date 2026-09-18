@@ -240,17 +240,33 @@ def _heart_score(frame: FrameObservation, ctx: DetectContext) -> FrameScore:
     return FrameScore(frame.timestamp, conf, anchor=((lw[0] + rw[0]) / 2, (lw[1] + rw[1]) / 2))
 
 
+def _arm_straight(frame: FrameObservation, side: str, ratio: float = 0.85) -> float:
+    """臂伸直度：|肩腕| / (|肩肘| + |肘腕|)，≈1 为完全伸直。"""
+    s = frame.keypoints.get(f"{side}_shoulder")
+    e = frame.keypoints.get(f"{side}_elbow")
+    w = frame.hand_center(side)
+    if not s or not e or not w:
+        return 0.0
+    se = _dist(s, e)
+    ew = _dist(e, w)
+    sw = _dist(s, w)
+    if se + ew < 1e-6:
+        return 0.0
+    return _clamp01((sw / (se + ew) - ratio) / (1.0 - ratio + 1e-6))
+
+
 def _make_point_scorer(sign: float) -> Callable[[FrameObservation, DetectContext], FrameScore]:
     """指向 sign<0 画面左 / sign>0 画面右：腕相对肩外展 + 手臂近水平。
 
-    外展阈值随 ``profile.amplitude_scale`` 缩放（低幅度用户手臂
-    伸展可能不到完整肩宽）。
+    外展按渐变打分（不做硬门槛），臂伸直降为弱因子——舞蹈中的指向
+    常带肘部弯曲，硬性伸直要求会把真实指向压到阈值下（真实视频校准）。
+    外展饱和度随 ``profile.amplitude_scale`` 缩放。
     """
 
     def scorer(frame: FrameObservation, ctx: DetectContext) -> FrameScore:
         scale = _scale(frame)
         amp = ctx.profile.amplitude_scale
-        need = 0.8 * max(amp, 0.55)
+        reach_full = 0.8 * max(amp, 0.55)
         best = FrameScore(frame.timestamp, 0.0)
         for side in ("left", "right"):
             wrist = frame.hand_center(side)
@@ -259,11 +275,12 @@ def _make_point_scorer(sign: float) -> Callable[[FrameObservation, DetectContext
             if not wrist or not shoulder:
                 continue
             dx = wrist[0] - shoulder[0]
-            extension = (dx * sign) / scale
-            if extension <= need:
+            reach = (dx * sign) / scale
+            if reach <= 0:
                 continue
-            horizontal = 1.0 - _clamp01(abs(wrist[1] - shoulder[1]) / (abs(dx) + 1e-6))
-            conf = _clamp01((extension - need) / (1.5 * need)) * _clamp01(0.4 + 0.6 * horizontal)
+            horizontal = _clamp01(1.0 - abs(wrist[1] - shoulder[1]) / max(abs(dx), 1e-6))
+            conf = (_clamp01(reach / reach_full) * horizontal
+                    * (0.35 + 0.65 * _arm_straight(frame, side)))
             if conf > best.conf:
                 base = elbow or shoulder
                 best = FrameScore(
@@ -277,12 +294,15 @@ def _make_point_scorer(sign: float) -> Callable[[FrameObservation, DetectContext
 
 
 def _wave_score(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameScore]:
-    """挥手：手腕高过肩 + 水平振荡（0.6s 窗口内 x 位移幅度）。
+    """挥手：手腕高过肩 + 窗口内 x 速度至少 2 次换向。
 
-    低幅度用户振荡范围按 amplitude_scale 放宽；震颤主体窗口加长。
+    换向计数（而非位移幅度）区分"来回摆"与"单向挥/举"——单侧划拉
+    或抬手定住不会产生多次换向，避免误报；低速抖动用速度下限滤掉。
+    低幅度用户速度阈值按 amplitude_scale 放宽；震颤主体窗口加长。
     """
     window = 0.9 if ctx.profile.tremor else 0.6
     amp = ctx.profile.amplitude_scale
+    v_min = 0.15 * amp  # 换向计入的最低 |vx|（归一化/秒），滤抖动
     history: Dict[str, List[Tuple[float, float]]] = {"left": [], "right": []}
     out: List[FrameScore] = []
     for frame in tracks.frames:
@@ -294,16 +314,28 @@ def _wave_score(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameSco
                 wrist = frame.hand_center(side)
                 if not wrist:
                     continue
-                raised = _clamp01((sh_y - wrist[1]) / scale - 0.1)
-                if raised > 0:
-                    xs = [x for t, x in history[side] if frame.timestamp - window <= t]
-                    xs.append(wrist[0])
-                    x_range = (max(xs) - min(xs)) / scale if xs else 0.0
-                    oscillation = _clamp01((x_range - 0.3 * amp) / (0.7 * amp))
-                    conf = _clamp01(raised * (0.4 + 0.6 * oscillation))
-                    if conf > best.conf:
-                        best = FrameScore(frame.timestamp, conf, anchor=wrist,
-                                          properties={"waving_hand": side})
+                raised = _clamp01((sh_y - wrist[1]) / (0.25 * scale))
+                if raised <= 0:
+                    continue
+                # 回看 window 内的 x 速度符号变化次数
+                pts = [(t, x) for t, x in history[side] if frame.timestamp - window <= t]
+                pts.append((frame.timestamp, wrist[0]))
+                flips = 0
+                prev_sign = 0
+                for (t0, x0), (t1, x1) in zip(pts, pts[1:]):
+                    dt = t1 - t0
+                    if dt <= 1e-6:
+                        continue
+                    vx = (x1 - x0) / dt
+                    sign = 1 if vx > v_min else (-1 if vx < -v_min else 0)
+                    if sign and prev_sign and sign != prev_sign:
+                        flips += 1
+                    if sign:
+                        prev_sign = sign
+                conf = _clamp01(raised * _clamp01((flips - 1) / 2.0))
+                if conf > best.conf:
+                    best = FrameScore(frame.timestamp, conf, anchor=wrist,
+                                      properties={"waving_hand": side})
         for side in ("left", "right"):
             pt = frame.hand_center(side)
             if pt:

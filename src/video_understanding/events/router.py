@@ -82,6 +82,15 @@ def route(query: Any) -> RoutedPlan:
             return plan
         entry = registry.lookup(canonical)
         if entry is None:
+            # 模块一对 first/last_action、音频事件也发 event_detection
+            # （来源是 BODY/AUDIO 同义词表），按对应策略分发而非落入
+            # 开放语义——无 verifier 时会白拿一个 failed。
+            if registry.is_structural(canonical):
+                plan.strategy = "structural"
+                return plan
+            if registry.is_audio(canonical):
+                plan.strategy = "audio_analyzer"
+                return plan
             plan.strategy = "open_semantic"
             plan.description = canonical
             return plan

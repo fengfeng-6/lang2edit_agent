@@ -320,10 +320,12 @@ class VideoUnderstanding:
         norm_scale = "shoulder" if profile.posture == "seated" else "person"
         predicate = compile_condition(plan.condition, norm_scale=norm_scale)
         samples = [(f.timestamp, predicate(f)) for f in manager.tracks.frames]
+        # 条件命中（举手、贴脸）在舞蹈里常只有零点几秒：阈值/时长放宽
+        # 后渐变打分段的短命中才不被吃掉（真实视频校准值）。
         config = TemporalConfig(
-            threshold=0.6, candidate_threshold=0.25,
-            min_duration=condition_min_duration(plan.condition, 0.2),
-            merge_gap=0.15, smooth_half_window=1,
+            threshold=0.4, candidate_threshold=0.25,
+            min_duration=condition_min_duration(plan.condition, 0.12),
+            merge_gap=0.25, smooth_half_window=1,
         )
         spans = aggregate(samples, config)
         canonical = _pose_condition_canonical(plan.condition)

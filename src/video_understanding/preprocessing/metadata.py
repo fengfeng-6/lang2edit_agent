@@ -7,6 +7,7 @@ metadata 提取两级降级：调用方提供 → ffprobe（系统命令，不�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -15,6 +16,20 @@ from pathlib import Path
 from typing import Optional, Union
 
 from ..models import VideoMetadata
+
+
+def video_id_for(path: Union[str, Path]) -> str:
+    """稳定 video_id：内容抽样哈希（首 256KB + 文件大小）。
+
+    同一视频文件改名/移动后 id 不变，语义状态与缓存可跨路径复用。
+    """
+    p = Path(path)
+    size = p.stat().st_size
+    digest = hashlib.sha1()
+    with p.open("rb") as handle:
+        digest.update(handle.read(256 * 1024))
+    digest.update(str(size).encode("utf-8"))
+    return f"vid_{digest.hexdigest()[:10]}"
 
 
 def _aspect_ratio(width: int, height: int) -> Optional[str]:
@@ -92,7 +107,7 @@ def metadata_from_ffprobe(path: Union[str, Path], *, video_id: Optional[str] = N
         width, height = height, width  # 旋转后对外的有效分辨率
 
     return VideoMetadata(
-        video_id=video_id or Path(path).stem,
+        video_id=video_id or video_id_for(path),
         duration=duration,
         fps=fps,
         width=width,
@@ -117,5 +132,11 @@ def resolve_metadata(video: Union[str, Path, dict, VideoMetadata]) -> VideoMetad
             return extracted
         if not meta:
             raise RuntimeError("video dict must include 'metadata' or a readable 'path'")
-        return metadata_from_dict(video.get("video_id", meta.get("video_id", "video")), meta)
+        vid = video.get("video_id") or meta.get("video_id")
+        if not vid and video.get("path"):
+            try:
+                vid = video_id_for(video["path"])
+            except OSError:
+                vid = None
+        return metadata_from_dict(vid or "video", meta)
     return metadata_from_ffprobe(video)
