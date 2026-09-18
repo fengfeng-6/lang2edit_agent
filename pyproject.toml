@@ -12,12 +12,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 模块二 video_understanding 核心：PyAV 解码/抽取、MediaPipe 关键点、librosa 节奏、scipy 平滑。
+# 注意：mediapipe 依赖 opencv-contrib-python（会顶掉 opencv-python，二者不可共存）。
+video = [
+  "av>=15",
+  "mediapipe>=1.0",
+  "librosa>=0.10",
+  "scipy>=1.11",
+]
+# 可选：真实 downbeat（ISMIR'24 Transformer，拉 torch ~2-3GB）。缺装时退化为启发式。
+audio = [
+  "beat_this>=1.0",
+]
 dev = [
   "pytest>=7.0",
 ]
 
 [project.scripts]
 gesture-intent = "gesture_intent.cli:main"
+video-understand = "video_understanding.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

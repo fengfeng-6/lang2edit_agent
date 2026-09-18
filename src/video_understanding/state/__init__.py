@@ -1,6 +1,8 @@
-"""语义状态管理（待实现）。
+"""语义状态管理。
 
-Semantic Video State（Dense Data 与 Semantic State 分离）；Query Cache /
-Query Coverage 与增量分析；分析结果失效管理（视频替换 / 裁剪 / 模型更新 /
-依赖变化）；Semantic View Builder；Analysis History。设计文档 §44-51。
+Semantic Video State 容器（``manager.py``：事件物化、event_uid /
+display_id / occurrence 分配、快照、失效管理 §47）；Query Cache 与
+Query Coverage（``cache.py``：all ⊇ index/first/last/range，§45-46）；
+Semantic View Builder（``view.py``，§49）；JSON 持久化——
+Dense Data 与 Semantic State 分离（``store.py``，§48/§50-51）。
 """
