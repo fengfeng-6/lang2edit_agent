@@ -27,7 +27,12 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 from gesture_intent.models import RequiredVideoQuery, model_validate
 
-from .audio.analyzer import AudioAnalyzer, LibrosaAudioAnalyzer, ProvidedAudioAnalyzer
+from .audio.analyzer import (
+    AudioAnalyzer,
+    LibrosaAudioAnalyzer,
+    ProvidedAudioAnalyzer,
+    default_audio_analyzer,
+)
 from .events.aggregator import AggregatedSpan, TemporalConfig, aggregate
 from .events.detectors import (
     DependencyError,
@@ -458,10 +463,10 @@ class VideoUnderstanding:
             if isinstance(payload, (dict, AudioAnalysis)):
                 analysis = ProvidedAudioAnalyzer(payload).analyze(asset)
             else:  # payload 是文件路径等非结构化输入 → 交给真实分析器
-                analyzer = self._audio_analyzer or LibrosaAudioAnalyzer()
+                analyzer = self._audio_analyzer or default_audio_analyzer()
                 analysis = analyzer.analyze(payload)
         else:
-            analyzer = self._audio_analyzer or LibrosaAudioAnalyzer()
+            analyzer = self._audio_analyzer or default_audio_analyzer()
             analysis = analyzer.analyze(asset)
         self._manager.state.audio_state[analysis.asset_id] = analysis
         self._manager.state.version += 1
