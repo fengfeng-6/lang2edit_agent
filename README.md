@@ -184,7 +184,8 @@ events/           router.py     策略路由：dedicated → pose_rule → open_
                   structural.py video_start/end、first/last_action（§39）
                   open_semantic.py  运动能量提案 + 可插拔 verifier（§24）
     │
-audio/            analyzer.py   BPM/beat/downbeat/onset（§33-35，§34 统一协议）
+audio/            analyzer.py   BPM/beat/downbeat/onset（§33-35，§34 统一协议）：
+                  注入数据 → librosa（PyAV 抽 PCM 兜底）→ 纯标准库 WAV 三级降级
     │
 state/            manager.py    事件物化：event_uid/display_id/occurrence（§37-38）
                   cache.py      Query Coverage：all ⊇ index/first/last/range（§45-46）
@@ -195,13 +196,16 @@ state/            manager.py    事件物化：event_uid/display_id/occurrence�
 ### 事件覆盖（MVP §59）
 
 - **手势**：heart_gesture、point_left/right、wave_hand、open/close_both_hands；
-  thumbs_up/v_sign/ok_sign 已注册，依赖 hand landmarks 轨道（按需 §11）。
+  thumbs_up/v_sign/ok_sign/finger_heart 依赖 hand landmarks 轨道——
+  轨道缺手部数据时自动触发 HandLandmarker 按需补跑再重试（§11 on-demand），
+  分析器不支持手部时记 `failed`。
 - **无障碍扩展手势**（残障用户重点适配）：single_hand_heart（单手抱心/贴脸比心）、
   finger_heart（手指比心，landmarks）、hand_raise（抬手）、head_tilt（歪头，
   无需手部）、clap（拍手）。
 - **身体动作**：turn_body、move_left/right、jump、squat、stand_up、lean_body、
   approach_camera、ending_pose。
-- **Pose Condition**：above/below/near/crossed/left_of/right_of + min_duration。
+- **Pose Condition**：above/below/near/crossed/left_of/right_of + min_duration；
+  手-身距离按躯干尺度归一（渐变打分，阈值真实视频校准）。
 - **音频**：bpm、beat、downbeat、music_onset（chorus_start 已注册未实现）。
 - **结构**：video_start/end、first_action、last_action。
 - **开放语义**：运动能量提案 + 注入式 verifier；未配置 verifier 时 `failed`。
@@ -245,6 +249,10 @@ snap = vu.get_spatial_snapshot(results[0].selected_event_uids[0])
 traj = vu.get_spatial_track("head")                      # 平滑轨迹（§9.4）
 view = vu.build_semantic_view()                          # 交付 Planner 的精简视图
 vu.invalidate({"type": "dependency", "name": "pose_track"})  # §47 失效
+# 失效三级：dependency/video → invalidated（事件标记不可用）；
+#   model 版本升级 → stale（结果保留可见，不再覆盖新查询，重查重算并取代）；
+#   query 单条 / edit 裁剪（no-op）。
+# 路径输入的 video_id 为内容哈希（首 256KB+大小），同内容跨路径复用状态。
 ```
 
 ```powershell

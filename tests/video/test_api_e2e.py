@@ -42,12 +42,19 @@ def test_cache_hit_and_incremental_analysis(analyzed):
     assert r2.cache_hit is True
     assert r2.status == QueryStatus.completed
     assert len(r2.selected_event_uids) == 1
-    assert len(analyzed.state.analysis_registry) == n_records  # 不产生新分析记录
+    # 缓存命中登记轻量记录（不重跑检测，deps 为空）：
+    # query_statuses / history 保持完整，事件补记 source_query_ids
+    assert len(analyzed.state.analysis_registry) == n_records + 1
+    light = analyzed.state.analysis_registry[-1]
+    assert light.query_id == r2.query_id
+    assert light.dependencies == [] and light.status == QueryStatus.completed
+    heart_events = [e for e in analyzed.state.semantic_events if e.canonical == "heart_gesture"]
+    assert all(light.query_id in e.source_query_ids for e in heart_events)
 
     # 新需求（point_left）触发增量分析：registry 只加一条
     [r3] = analyzed.resolve_queries([{"type": "event_detection", "event": "point_left"}])
     assert r3.cache_hit is False and r3.status == QueryStatus.completed
-    assert len(analyzed.state.analysis_registry) == n_records + 1
+    assert len(analyzed.state.analysis_registry) == n_records + 2
 
 
 def test_not_found_vs_failed(analyzed):
@@ -150,6 +157,38 @@ def test_invalidation_by_dependency(analyzed):
     assert all(e.invalidated for e in analyzed.state.semantic_events)
     # 失效事件不再出现在读取结果里
     assert analyzed.get_semantic_events() == []
+
+
+def test_model_invalidation_marks_stale_keeps_events(analyzed):
+    """模型版本升级 → stale：结果保留可见，但不再覆盖新查询（§47）。"""
+    analyzed.resolve_queries([HEART_ALL])
+    record = analyzed.state.analysis_registry[0]
+    summary = analyzed.invalidate({"type": "model", "name": "heart_gesture"})
+    assert summary["stale_queries"] == 1
+    assert record.validity == "stale"
+    assert record.status == QueryStatus.completed  # status 保留
+    assert len(analyzed.get_semantic_events()) == 2  # 事件不清空
+    # stale 不覆盖 → 重查重跑；同 canonical 取代旧事件而非重复累加
+    [r] = analyzed.resolve_queries([HEART_ALL])
+    assert r.cache_hit is False and r.status == QueryStatus.completed
+    assert len(analyzed.get_semantic_events()) == 2
+
+
+def test_single_query_invalidation(analyzed):
+    analyzed.resolve_queries([HEART_ALL,
+                              {"type": "event_detection", "event": "point_left"}])
+    heart_qid = analyzed.state.analysis_registry[0].query_id
+    summary = analyzed.invalidate({"type": "query", "name": heart_qid})
+    assert summary["invalidated_queries"] == 1
+    assert all(e.invalidated for e in analyzed.state.semantic_events
+               if e.canonical == "heart_gesture")
+    assert any(not e.invalidated for e in analyzed.state.semantic_events)
+
+
+def test_resolve_queries_dedupes_identical(analyzed):
+    [r1, r2] = analyzed.resolve_queries([HEART_ALL, HEART_ALL])
+    assert r1.query_id == r2.query_id and r1 is r2
+    assert len(analyzed.state.analysis_registry) == 1
 
 
 def test_edit_trim_does_not_invalidate(analyzed):

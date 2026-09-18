@@ -551,6 +551,9 @@ class AnalysisRecord(StrictModel):
     source_video_version: Optional[str] = None
     dependencies: List[str] = Field(default_factory=list)
     error: Optional[str] = None
+    # 结果可用性（§47）：valid 可复用；stale=模型版本变更，结果保留待重算
+    # 但不再覆盖新查询；invalidated=依赖失效，事件一并标记不可用。
+    validity: str = "valid"
 
 
 class AnalysisHistoryEntry(StrictModel):
@@ -599,6 +602,7 @@ class SemanticVideoState(StrictModel):
     semantic_events: List[SemanticEvent] = Field(default_factory=list)
     spatial_snapshots: Dict[str, SpatialSnapshot] = Field(default_factory=dict)
     track_artifact_ids: List[str] = Field(default_factory=list)
+    spatial_summary: Dict[str, Any] = Field(default_factory=dict)  # 轨道摘要：person_present_ratio/frames/targets
     spatial_asset_refs: List[Dict[str, Any]] = Field(default_factory=list)  # §32 segmentation 等
     audio_state: Dict[str, AudioAnalysis] = Field(default_factory=dict)  # asset_id -> 分析
     structural_state: StructuralState = Field(default_factory=StructuralState)
