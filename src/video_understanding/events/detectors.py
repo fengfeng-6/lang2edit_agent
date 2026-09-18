@@ -223,21 +223,52 @@ def _anchor_extras(resolve: Callable[[FrameObservation], Optional[Point2]]):
 # ---------------------------------------------------------------------------
 
 
-def _heart_score(frame: FrameObservation, ctx: DetectContext) -> FrameScore:
-    """比心：双手合拢是决定性特征——closeness 不足时一票否决，
-    避免"双手高举分开"等姿态被 lift 项单独顶成候选。"""
-    lw = frame.hand_center("left")
-    rw = frame.hand_center("right")
-    sh_y = _shoulder_y(frame)
-    if not lw or not rw or sh_y is None:
-        return FrameScore(frame.timestamp, 0.0)
-    scale = _scale(frame)
-    closeness = _clamp01(1.0 - _dist(lw, rw) / (1.0 * scale))
-    if closeness < 0.25:
-        return FrameScore(frame.timestamp, 0.0)
-    lift = _clamp01((sh_y - max(lw[1], rw[1])) / scale + 0.25)
-    conf = _clamp01(0.7 * closeness + 0.3 * lift)
-    return FrameScore(frame.timestamp, conf, anchor=((lw[0] + rw[0]) / 2, (lw[1] + rw[1]) / 2))
+def _heart_score(tracks: DenseSpatialTracks, ctx: DetectContext) -> List[FrameScore]:
+    """比心：双手合拢 + 近同高对称 + 保持静止。
+
+    双手接近只是必要条件——转手/交叉/合十同样满足，仅靠 closeness
+    会在手势舞里整段误报（test_video 抽帧验证，远程实现亦判
+    not_found）。再要求：
+    - 两腕近同高（比心双手对称成拱；交叉/叠掌一上一下）；
+    - 腕部路径速度低（比心保持一拍以上；转手/划拉持续运动——
+      用路程不用净位移，转圈回到原位净位移近零但路程很大）。
+    残余盲区：合十/叠掌等"静态合拢"在腕级特征下不可分，
+    需手部关键点（手指构型）进一步区分——见 landmark 系检测器。
+    """
+    window = 0.3  # 腕速回看窗（秒）
+    history: Dict[str, List[Tuple[float, Point2]]] = {"left": [], "right": []}
+    out: List[FrameScore] = []
+    for frame in tracks.frames:
+        lw = frame.hand_center("left")
+        rw = frame.hand_center("right")
+        sh_y = _shoulder_y(frame)
+        scale = _scale(frame)
+        conf = 0.0
+        if lw and rw and sh_y is not None:
+            closeness = _clamp01(1.0 - _dist(lw, rw) / scale)
+            if closeness >= 0.25:
+                symmetry = _clamp01(1.0 - abs(lw[1] - rw[1]) / (0.5 * scale))
+                speeds = []
+                for side, w in (("left", lw), ("right", rw)):
+                    seq = [(t, p) for t, p in history[side]
+                           if frame.timestamp - window <= t]
+                    seq.append((frame.timestamp, w))
+                    if len(seq) >= 2:
+                        path = sum(_dist(seq[i + 1][1], seq[i][1])
+                                   for i in range(len(seq) - 1))
+                        speeds.append(path / max(seq[-1][0] - seq[0][0], 1e-4) / scale)
+                speed = max(speeds) if speeds else 0.0
+                stillness = _clamp01(1.0 - speed / 1.5)
+                lift = _clamp01((sh_y - max(lw[1], rw[1])) / scale + 0.25)
+                conf = _clamp01(
+                    closeness * (0.45 * symmetry + 0.35 * stillness + 0.2 * lift))
+        out.append(FrameScore(
+            frame.timestamp, conf,
+            anchor=((lw[0] + rw[0]) / 2, (lw[1] + rw[1]) / 2) if lw and rw else None))
+        for side, pt in (("left", lw), ("right", rw)):
+            if pt:
+                history[side].append((frame.timestamp, pt))
+    return out
 
 
 def _arm_straight(frame: FrameObservation, side: str, ratio: float = 0.85) -> float:
@@ -734,7 +765,7 @@ def _landmark_detector(fn: Callable[[Dict[str, Point2]], float]) -> RuleDetector
 
 def build_detector(name: str) -> RuleDetector:
     if name == "heart_gesture":
-        return _per_frame(_heart_score, required_parts=["both_hands"])
+        return RuleDetector(_heart_score, required_parts=["both_hands"])
     if name == "point_left":
         return _per_frame(_make_point_scorer(-1.0), required_parts=["any_hand"])
     if name == "point_right":
