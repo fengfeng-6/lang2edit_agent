@@ -121,14 +121,89 @@ def metadata_from_ffprobe(path: Union[str, Path], *, video_id: Optional[str] = N
     )
 
 
+def _rotation_degrees(stream, fallback: int = 0) -> int:
+    """从容器侧数据/标签读旋转角；取不到用 fallback。"""
+    try:  # PyAV >= 12: DISPLAYMATRIX side data
+        side = stream.side_data.get("DISPLAYMATRIX")  # type: ignore[attr-defined]
+        if side is not None and getattr(side, "rotation", None) is not None:
+            return int(-side.rotation) % 360  # displaymatrix 方向与 metadata rotate 相反
+    except Exception:
+        pass
+    rotate = (getattr(stream, "metadata", None) or {}).get("rotate")
+    if rotate is not None:
+        try:
+            return int(float(rotate)) % 360
+        except (TypeError, ValueError):
+            pass
+    return int(fallback) % 360
+
+
+def metadata_from_pyav(path: Union[str, Path], *, video_id: Optional[str] = None) -> VideoMetadata:
+    """PyAV 提取 metadata——ffprobe 二进制不可用时的降级（§6）。
+
+    同属 ``[video]`` extras：装了 av 的环境即可不依赖 ffmpeg CLI。
+    """
+    try:
+        import av
+    except ImportError as exc:
+        raise RuntimeError(
+            "metadata extraction needs ffprobe on PATH or PyAV "
+            '(pip install -e ".[video]")'
+        ) from exc
+
+    with av.open(str(path)) as container:
+        vstream = next((s for s in container.streams if s.type == "video"), None)
+        if vstream is None:
+            raise RuntimeError(f"no video stream in {path}")
+        astream = next((s for s in container.streams if s.type == "audio"), None)
+
+        fps = 0.0
+        rate = getattr(vstream, "average_rate", None) or getattr(vstream, "base_rate", None)
+        if rate:
+            fps = float(rate)
+        duration = float(container.duration / 1e6) if container.duration else 0.0
+        if not duration and vstream.duration and vstream.time_base:
+            duration = float(vstream.duration * vstream.time_base)
+        rotation = _rotation_degrees(vstream)
+        width = int(getattr(vstream.codec_context, "width", 0) or 0)
+        height = int(getattr(vstream.codec_context, "height", 0) or 0)
+        if rotation in (90, 270):
+            width, height = height, width  # 旋转后对外的有效分辨率
+        return VideoMetadata(
+            video_id=video_id or video_id_for(path),
+            duration=duration,
+            fps=fps,
+            width=width,
+            height=height,
+            aspect_ratio=_aspect_ratio(width, height),
+            codec=getattr(vstream.codec_context, "name", None),
+            rotation=rotation,
+            has_audio=astream is not None,
+            audio_sample_rate=(
+                int(astream.codec_context.sample_rate)
+                if astream is not None and getattr(astream.codec_context, "sample_rate", None)
+                else None
+            ),
+            source_uri=str(path),
+        )
+
+
+def metadata_from_path(path: Union[str, Path], *, video_id: Optional[str] = None) -> VideoMetadata:
+    """路径输入的 metadata：ffprobe → PyAV → 报错（§6/§42 不静默猜测）。"""
+    try:
+        return metadata_from_ffprobe(path, video_id=video_id)
+    except RuntimeError:
+        return metadata_from_pyav(path, video_id=video_id)
+
+
 def resolve_metadata(video: Union[str, Path, dict, VideoMetadata]) -> VideoMetadata:
-    """统一入口：dict/VideoMetadata 直接使用，路径走 ffprobe。"""
+    """统一入口：dict/VideoMetadata 直接使用，路径走 ffprobe → PyAV。"""
     if isinstance(video, VideoMetadata):
         return video
     if isinstance(video, dict):
         meta = dict(video.get("metadata") or {})
         if video.get("path") and not meta:
-            extracted = metadata_from_ffprobe(video["path"], video_id=video.get("video_id"))
+            extracted = metadata_from_path(video["path"], video_id=video.get("video_id"))
             return extracted
         if not meta:
             raise RuntimeError("video dict must include 'metadata' or a readable 'path'")
@@ -139,4 +214,4 @@ def resolve_metadata(video: Union[str, Path, dict, VideoMetadata]) -> VideoMetad
             except OSError:
                 vid = None
         return metadata_from_dict(vid or "video", meta)
-    return metadata_from_ffprobe(video)
+    return metadata_from_path(video)

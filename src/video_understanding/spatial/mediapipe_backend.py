@@ -62,23 +62,6 @@ def _default_model_dir() -> Path:
 _ROTATE_K = {0: 0, 90: 3, 180: 2, 270: 1}  # 容器 rotate=N（顺时针）→ np.rot90 逆时针 4-N 次转正
 
 
-def _rotation_of(stream, fallback: int = 0) -> int:
-    """从容器侧数据/标签读旋转角；取不到用 fallback（如注入的 metadata.rotation）。"""
-    try:  # PyAV >= 12: DISPLAYMATRIX side data
-        side = stream.side_data.get("DISPLAYMATRIX")  # type: ignore[attr-defined]
-        if side is not None and getattr(side, "rotation", None) is not None:
-            return int(-side.rotation) % 360  # displaymatrix 方向与 metadata rotate 相反
-    except Exception:
-        pass
-    rotate = (getattr(stream, "metadata", None) or {}).get("rotate")
-    if rotate is not None:
-        try:
-            return int(float(rotate)) % 360
-        except (TypeError, ValueError):
-            pass
-    return int(fallback) % 360
-
-
 class MediaPipeSpatialAnalyzer:
     """Base Spatial Analysis 的默认真实实现（§8/§11）。
 
@@ -181,6 +164,7 @@ class MediaPipeSpatialAnalyzer:
             container = av.open(path)
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
+            from ..preprocessing.metadata import _rotation_degrees
             meta_rotation = 0
             if isinstance(video, VideoMetadata):
                 meta_rotation = int(video.rotation or 0)
@@ -189,7 +173,7 @@ class MediaPipeSpatialAnalyzer:
                     meta_rotation = int((video.get("metadata") or {}).get("rotation") or 0)
                 except (TypeError, ValueError):
                     meta_rotation = 0
-            rot_k = _ROTATE_K.get(_rotation_of(stream, fallback=meta_rotation) % 360, 0)
+            rot_k = _ROTATE_K.get(_rotation_degrees(stream, fallback=meta_rotation) % 360, 0)
             index = -1
             for av_frame in container.decode(stream):
                 index += 1
