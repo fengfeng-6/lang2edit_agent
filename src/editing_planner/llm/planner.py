@@ -169,7 +169,17 @@ class OpenAICompatibleCreativePlanner:
             "强调程度、大概持续时间、素材相对位置偏好。"
             "禁止输出时间戳、event_uid、坐标、素材文件或 URL——"
             "那些由确定性代码和上游模块决定。必须返回 JSON，顶层包含 "
-            "global_strategy 和 item_directives 两个键。"
+            "global_strategy 和 item_directives 两个键，字段名严格如下：\n"
+            "global_strategy: {\"motion_language\": [字符串...]}\n"
+            "item_directives: [{"
+            "\"requirement_id\": 与输入需求 id 完全一致的字符串,"
+            "\"animation\": \"pop|soft_pop|fade|glow|flash|particle|float|none\" 之一,"
+            "\"emphasis\": \"low|medium|high\" 之一,"
+            "\"palette\": [颜色/风格字符串...],"
+            "\"duration_hint\": 0.2 到 5.0 之间的秒数,"
+            "\"relation_preference\": \"above|below|left_of|right_of|"
+            "upper_left|upper_right|screen_left|screen_right|centered_on|follow\" 之一"
+            "}]"
         )
         payload = {
             "model": self.model,
@@ -180,7 +190,7 @@ class OpenAICompatibleCreativePlanner:
                     "content": json.dumps(context, ensure_ascii=False),
                 },
             ],
-            "response_format": {"type": "json_object"},
+            "response_format": self._response_format(),
         }
         if "reasoner" not in self.model.lower() and "reasoning" not in self.model.lower():
             payload["temperature"] = 0
@@ -215,6 +225,64 @@ class OpenAICompatibleCreativePlanner:
                 content = content[:-3].strip()
         return json.loads(content)
 
+    @staticmethod
+    def _response_format() -> Dict[str, Any]:
+        """PLANNER_LLM_RESPONSE_FORMAT=json_object|json_schema（模块一同惯例）。"""
+        if os.getenv("PLANNER_LLM_RESPONSE_FORMAT", "json_object").lower() == "json_schema":
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "creative_directives",
+                    "strict": True,
+                    "schema": _DIRECTIVE_SCHEMA,
+                },
+            }
+        return {"type": "json_object"}
+
 
 def default_creative_planner() -> StructuredCreativePlanner:
     return OpenAICompatibleCreativePlanner.from_environment() or RuleBasedCreativePlanner()
+
+
+#: PLANNER_LLM_RESPONSE_FORMAT=json_schema 时发送的输出契约 schema
+_DIRECTIVE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "global_strategy": {
+            "type": "object",
+            "properties": {
+                "motion_language": {"type": "array", "items": {"type": "string"}},
+                "visual_language": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["motion_language"],
+            "additionalProperties": False,
+        },
+        "item_directives": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "requirement_id": {"type": "string"},
+                    "animation": {
+                        "type": "string",
+                        "enum": ["pop", "soft_pop", "fade", "glow", "flash",
+                                 "particle", "float", "none"],
+                    },
+                    "emphasis": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "palette": {"type": "array", "items": {"type": "string"}},
+                    "duration_hint": {"type": "number"},
+                    "relation_preference": {
+                        "type": "string",
+                        "enum": ["above", "below", "left_of", "right_of",
+                                 "upper_left", "upper_right", "screen_left",
+                                 "screen_right", "centered_on", "follow"],
+                    },
+                },
+                "required": ["requirement_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["global_strategy", "item_directives"],
+    "additionalProperties": False,
+}
