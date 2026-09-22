@@ -646,3 +646,7 @@ class SemanticView(StrictModel):
     audio_summary: Dict[str, Any] = Field(default_factory=dict)
     structural: Dict[str, Any] = Field(default_factory=dict)
     query_statuses: Dict[str, str] = Field(default_factory=dict)
+    # 模块三 §8：主体可动性画像随视图下发，Planner 不从稠密轨迹重推断；
+    # §49 provenance 需要 state_version 做 stale 检测。
+    subject_profile: Dict[str, Any] = Field(default_factory=dict)
+    state_version: int = 0

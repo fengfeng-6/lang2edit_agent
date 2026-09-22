@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 一、自然语言需求理解 | `gesture_intent` | ✅ 已实现 | [docs/模块一-自然语言需求理解.md](docs/模块一-自然语言需求理解.md) |
 | 二、视频理解 | `video_understanding` | ✅ 已实现（核心链路 + 规则检测器；CV/音频重模型为可选适配器） | [docs/模块二-视频理解.md](docs/模块二-视频理解.md) |
-| 三、剪辑规划 | `editing_planner`（预留名） | 未开始 | — |
+| 三、剪辑规划 | `editing_planner` | ✅ 已实现（两阶段 Plan + 无障碍校验 + LLM 创意接缝） | [docs/自然语言驱动视频剪辑 Agent——模块三：剪辑规划模块工程设计文档.md](docs/自然语言驱动视频剪辑%20Agent——模块三：剪辑规划模块工程设计文档.md) |
 | 四、素材搜索与管理 | `asset_manager`（预留名） | 未开始 | — |
 | 五、剪辑工具执行 | `edit_executor`（预留名） | 未开始 | — |
 | 六、反馈与持续修改 | `session_feedback`（预留名） | 未开始 | — |
@@ -280,6 +280,54 @@ MVP 范围与验收标准见 [docs/模块二-视频理解.md](docs/模块二-视
 
 ---
 
+## 模块三：剪辑规划 `editing_planner`
+
+把模块一 `EditingIntent` + 模块二 `SemanticView` + 无障碍画像 + 工具能力
+转换为**两阶段、软件无关**的剪辑计划（设计文档 §9-10）：
+
+```text
+EditingPlannerInput
+    → plan()          → LogicalEditingPlan   （想实现什么）
+    → materialize()   → ResolvedEditingPlan  （素材返回后具体怎么实现）
+```
+
+- **LLM 只产创作决策**（§19/§61）：GlobalStrategy / StyleSpec 由
+  `StructuredCreativePlanner` Protocol 产出（`PLANNER_LLM_*`/`OPENAI_*`
+  环境变量启用 OpenAI 适配器，无 key 用规则实现，失败自动回退并记
+  `provenance.planner_mode`）；事件选择、event_uid 绑定、时间/空间
+  解析、避让、素材去重、能力检查、校验全部确定性代码。
+- **无障碍一级场景**（§3-4）：坐姿/轮椅不降级为"站姿 fallback"，而是
+  独立策略——P0 脸 → P1 手势区/活跃手 → P2 上躯干 → P3 轮椅/主体区
+  的避让优先级、低幅度语义视觉增强（软 pop/局部光/节拍闪，绝不
+  镜头摇晃）、震颤平滑跟随、单侧上肢锚点。
+- **PlanItem 可追踪**（§11-12）：`plan_key = req_id:event_uid:operation`
+  → `plan_item_uid = pln_<sha1[:8]>`，局部重规划按 plan_key 对齐，
+  未变需求原样保留（§52/§60 PlanPatch）。
+- **能力降级不静默**（§41）：hard 走等价链（tracking→keyframes，
+  耗尽即 blocked）；soft 可简化到 static + warning；
+  `degradation_applied` 记录每步降级。
+- **缺数据不越界**（§46）：未分析事件/缺分割 mask 输出
+  `PlannerDependencyRequest` 交 Agent Controller，Planner 不调模块二。
+
+```powershell
+editing-planner plan --input examples/planner_input.json --pretty
+editing-planner materialize --plan plan.json --bindings bindings.json --view view.json
+editing-planner replan --existing plan.json --intent intent.json --patch patch.json --view view.json
+```
+
+| 环境变量 | 说明 | 默认 |
+|---|---|---|
+| `PLANNER_LLM_API_KEY` / `OPENAI_API_KEY` | 设置后才启用 LLM 创意规划 | 无（规则） |
+| `PLANNER_LLM_BASE_URL` / `OPENAI_BASE_URL` | OpenAI-compatible 服务地址 | `https://models.sjtu.edu.cn/api/v1` |
+| `PLANNER_LLM_MODEL` / `OPENAI_MODEL` | 模型名 | `deepseek-reasoner` |
+| `PLANNER_LLM_TIMEOUT` | 请求超时（秒） | `60` |
+
+验收场景（§56-60，见 `tests/planner/`）：每次比心粉色爱心不挡脸、
+轮椅+低幅度"更有活力"、皇冠跟头三级降级、坐姿换背景保护轮椅、
+"第二个爱心小一点"只更新对应 PlanItem。
+
+---
+
 ## 测试
 
 ```powershell
@@ -297,6 +345,13 @@ not_found/failed 区分、空间快照与轨迹、音频事件物化、结构化
 失效管理（依赖/视频/裁剪）、状态持久化往返、CLI 往返、模块一查询对接、
 无障碍适配（profile 推断、单手降级、坐姿归一化、低幅度阈值、震颤平滑、
 镜像修正、覆盖度降级）。
+
+覆盖（模块三，`tests/planner/`）：模型双版本往返与校验、occurrence 展开
+（全/首末/序号/范围/between）、缺失与 uncertain 事件→依赖请求、
+时间锚点与 freeze 移位表、节拍对齐阈值、空间关系偏移与 P0-P3 避让、
+跟随/震颤/单手锚点、能力降级矩阵（§58）、无障碍校验十项、
+§56-60 五个验收场景端到端、PlanPatch 局部重规划、save/load、CLI 往返、
+LLM 越权输出白名单拦截。
 
 新增模块的测试放在 `tests/<模块短名>/` 下（如 `tests/video/`），
 各目录内测试文件 basename 需全局唯一（pytest prepend 导入模式要求）。
