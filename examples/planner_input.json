@@ -1,0 +1,419 @@
+{
+  "editing_intent": {
+    "global_intent": {
+      "theme": {
+        "raw": "夏日可爱",
+        "canonical": "summer",
+        "tags": [
+          "cute",
+          "pink"
+        ],
+        "confidence": null
+      },
+      "mood": null,
+      "style": null,
+      "pacing": null,
+      "color_preference": null,
+      "platform_style": null,
+      "autonomy": null
+    },
+    "object_requirements": [],
+    "event_bound_requirements": [
+      {
+        "id": "event_req_01",
+        "source_text": "每次比心的时候出现粉色爱心",
+        "trigger": {
+          "event": {
+            "type": "gesture",
+            "raw": "heart_gesture",
+            "canonical": "heart_gesture",
+            "condition": null,
+            "confidence": 0.9
+          },
+          "occurrence": {
+            "type": "all",
+            "value": null,
+            "start": null,
+            "end": null
+          },
+          "temporal_relation": "at_event"
+        },
+        "requirement": {
+          "object_type": "sticker",
+          "action": "add",
+          "semantic_description": {
+            "raw": "粉色爱心",
+            "canonical": "heart",
+            "tags": [
+              "pink",
+              "cute"
+            ],
+            "confidence": null
+          },
+          "content": null,
+          "operation": null
+        },
+        "constraint_level": "hard",
+        "confidence": 0.9,
+        "field_confidence": {}
+      }
+    ],
+    "explicit_operations": [],
+    "constraints": [
+      {
+        "id": "constraint_01",
+        "scope": {},
+        "type": "avoid_overlap",
+        "reference": "face",
+        "preference": null,
+        "raw": "不要挡脸",
+        "constraint_level": "hard",
+        "confidence": 0.9
+      }
+    ],
+    "unresolved": []
+  },
+  "semantic_view": {
+    "video": {
+      "video_id": "vid_test",
+      "duration": 12.0,
+      "fps": 15.0,
+      "resolution": [
+        720,
+        1280
+      ],
+      "aspect_ratio": "9:16",
+      "has_audio": true,
+      "version": "v1"
+    },
+    "relevant_events": [
+      {
+        "event_uid": "evt_clap",
+        "display_id": "gesture_clap_01",
+        "canonical": "clap",
+        "event_type": "gesture",
+        "occurrence_index": 1,
+        "start_time": 2.0,
+        "peak_time": 2.2,
+        "end_time": 2.4,
+        "confidence": 0.9,
+        "status": "confirmed",
+        "invalidated": false,
+        "properties": {}
+      },
+      {
+        "event_uid": "evt_h1",
+        "display_id": "gesture_heart_01",
+        "canonical": "heart_gesture",
+        "event_type": "gesture",
+        "occurrence_index": 1,
+        "start_time": 4.0,
+        "peak_time": 4.35,
+        "end_time": 4.7,
+        "confidence": 0.9,
+        "status": "confirmed",
+        "invalidated": false,
+        "properties": {}
+      },
+      {
+        "event_uid": "evt_p1",
+        "display_id": "gesture_point_01",
+        "canonical": "point_right",
+        "event_type": "gesture",
+        "occurrence_index": 1,
+        "start_time": 6.0,
+        "peak_time": 6.3,
+        "end_time": 6.6,
+        "confidence": 0.9,
+        "status": "confirmed",
+        "invalidated": false,
+        "properties": {}
+      },
+      {
+        "event_uid": "evt_h2",
+        "display_id": "gesture_heart_02",
+        "canonical": "heart_gesture",
+        "event_type": "gesture",
+        "occurrence_index": 2,
+        "start_time": 9.8,
+        "peak_time": 10.35,
+        "end_time": 10.9,
+        "confidence": 0.9,
+        "status": "confirmed",
+        "invalidated": false,
+        "properties": {}
+      },
+      {
+        "event_uid": "evt_end",
+        "display_id": "body_ending_01",
+        "canonical": "ending_pose",
+        "event_type": "body_action",
+        "occurrence_index": 1,
+        "start_time": 11.0,
+        "peak_time": 11.4,
+        "end_time": 11.8,
+        "confidence": 0.9,
+        "status": "confirmed",
+        "invalidated": false,
+        "properties": {}
+      }
+    ],
+    "spatial_summaries": {
+      "gesture_clap_01": {
+        "event_anchor": [
+          0.5,
+          0.5
+        ],
+        "face_bbox": [
+          0.4,
+          0.08,
+          0.6,
+          0.24
+        ],
+        "person_bbox": [
+          0.3,
+          0.06,
+          0.7,
+          0.95
+        ],
+        "head_center": [
+          0.5,
+          0.16
+        ],
+        "protected_regions": {
+          "face": [
+            0.38,
+            0.06,
+            0.62,
+            0.26
+          ]
+        },
+        "hands": {
+          "left": [
+            0.42,
+            0.58
+          ],
+          "right": [
+            0.58,
+            0.58
+          ]
+        },
+        "timestamp": 4.35
+      },
+      "gesture_heart_01": {
+        "event_anchor": [
+          0.5,
+          0.62
+        ],
+        "face_bbox": [
+          0.4,
+          0.08,
+          0.6,
+          0.24
+        ],
+        "person_bbox": [
+          0.3,
+          0.06,
+          0.7,
+          0.95
+        ],
+        "head_center": [
+          0.5,
+          0.16
+        ],
+        "protected_regions": {
+          "face": [
+            0.38,
+            0.06,
+            0.62,
+            0.26
+          ]
+        },
+        "hands": {
+          "left": [
+            0.42,
+            0.58
+          ],
+          "right": [
+            0.58,
+            0.58
+          ]
+        },
+        "timestamp": 4.35
+      },
+      "gesture_point_01": {
+        "event_anchor": [
+          0.5,
+          0.62
+        ],
+        "face_bbox": [
+          0.4,
+          0.08,
+          0.6,
+          0.24
+        ],
+        "person_bbox": [
+          0.3,
+          0.06,
+          0.7,
+          0.95
+        ],
+        "head_center": [
+          0.5,
+          0.16
+        ],
+        "protected_regions": {
+          "face": [
+            0.38,
+            0.06,
+            0.62,
+            0.26
+          ]
+        },
+        "hands": {
+          "left": [
+            0.42,
+            0.58
+          ],
+          "right": [
+            0.58,
+            0.58
+          ]
+        },
+        "timestamp": 4.35,
+        "direction": {
+          "vector": [
+            1.0,
+            0.0
+          ],
+          "label": "right"
+        }
+      },
+      "gesture_heart_02": {
+        "event_anchor": [
+          0.5,
+          0.62
+        ],
+        "face_bbox": [
+          0.4,
+          0.08,
+          0.6,
+          0.24
+        ],
+        "person_bbox": [
+          0.3,
+          0.06,
+          0.7,
+          0.95
+        ],
+        "head_center": [
+          0.5,
+          0.16
+        ],
+        "protected_regions": {
+          "face": [
+            0.38,
+            0.06,
+            0.62,
+            0.26
+          ]
+        },
+        "hands": {
+          "left": [
+            0.42,
+            0.58
+          ],
+          "right": [
+            0.58,
+            0.58
+          ]
+        },
+        "timestamp": 4.35
+      },
+      "body_ending_01": {
+        "event_anchor": [
+          0.5,
+          0.4
+        ],
+        "face_bbox": [
+          0.4,
+          0.08,
+          0.6,
+          0.24
+        ],
+        "person_bbox": [
+          0.3,
+          0.06,
+          0.7,
+          0.95
+        ],
+        "head_center": [
+          0.5,
+          0.16
+        ],
+        "protected_regions": {
+          "face": [
+            0.38,
+            0.06,
+            0.62,
+            0.26
+          ]
+        },
+        "hands": {
+          "left": [
+            0.42,
+            0.58
+          ],
+          "right": [
+            0.58,
+            0.58
+          ]
+        },
+        "timestamp": 4.35
+      }
+    },
+    "audio_summary": {
+      "original_audio": {
+        "bpm": 120.0,
+        "beat_count": 24,
+        "downbeat_count": 6,
+        "downbeats": [
+          0.0,
+          2.0,
+          4.0,
+          6.0,
+          8.0,
+          10.0
+        ]
+      }
+    },
+    "structural": {
+      "video_start": 0.0,
+      "video_end": 12.0,
+      "first_action": {
+        "event_ref": "evt_clap"
+      },
+      "last_action": {
+        "event_ref": "evt_end"
+      }
+    },
+    "query_statuses": {},
+    "subject_profile": {
+      "posture": "seated",
+      "available_hands": [
+        "left",
+        "right"
+      ],
+      "amplitude": "low",
+      "amplitude_scale": 0.6,
+      "tremor": false,
+      "mirrored": false,
+      "inferred": true
+    },
+    "state_version": 3
+  },
+  "tool_capabilities": {
+    "tracking": false,
+    "keyframes": true
+  }
+}

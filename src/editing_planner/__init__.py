@@ -1,0 +1,118 @@
+"""editing_planner — 模块三：剪辑规划。
+
+把模块一 ``EditingIntent`` + 模块二 ``SemanticView`` + 无障碍画像 +
+工具能力转换为两阶段剪辑计划（模块三设计文档 §9-10）：
+
+    EditingPlannerInput
+        → plan()          → LogicalEditingPlan   （想实现什么）
+        → materialize()   → ResolvedEditingPlan  （素材返回后具体怎么实现）
+
+LLM 只参与创作决策（GlobalStrategy / StyleSpec，§19/§61）；事件选择、
+event_uid 绑定、时间空间解析、避让、去重、能力检查与校验全部确定性。
+"""
+
+# 必须先于子模块导入赋值——api.py 以 from . import __version__ 读它
+__version__ = "0.1.0"
+
+from .api import EditingPlanner
+from .models import (
+    AccessibilityPlanningProfile,
+    AccessibilityStrategy,
+    AnchorType,
+    AssetBinding,
+    AssetRequest,
+    DegradationPolicy,
+    DependencyType,
+    DurationMode,
+    DurationSpec,
+    EditingPlannerInput,
+    EventBoundary,
+    FollowSpec,
+    GlobalStrategy,
+    LayoutPreferences,
+    LogicalEditingPlan,
+    PlanItem,
+    PlanItemProvenance,
+    PlanItemStatus,
+    PlanOperation,
+    PlanPatch,
+    PlannerContext,
+    PlannerDependencyRequest,
+    PlannerMode,
+    PlanProvenance,
+    ProjectTime,
+    ResolvedEditingPlan,
+    ResolvedPlanItem,
+    ReusePolicy,
+    SpatialAnchor,
+    SpatialAnchorType,
+    SpatialRelation,
+    SpatialSpec,
+    StyleSpec,
+    SubReport,
+    TemporalSpec,
+    TimeAnchor,
+    TimelineEffect,
+    TimelineMapping,
+    TimelineStructure,
+    TimelineTrack,
+    ToolCapabilityProfile,
+    Transform,
+    AnimationSpec,
+    UnfulfilledRequirement,
+    ValidationIssue,
+    ValidationReport,
+    ValidationStatus,
+)
+
+__all__ = [
+    "EditingPlanner",
+    "AccessibilityPlanningProfile",
+    "AccessibilityStrategy",
+    "AnchorType",
+    "AssetBinding",
+    "AssetRequest",
+    "DegradationPolicy",
+    "DependencyType",
+    "DurationMode",
+    "DurationSpec",
+    "EditingPlannerInput",
+    "EventBoundary",
+    "FollowSpec",
+    "GlobalStrategy",
+    "LayoutPreferences",
+    "LogicalEditingPlan",
+    "PlanItem",
+    "PlanItemProvenance",
+    "PlanItemStatus",
+    "PlanOperation",
+    "PlanPatch",
+    "PlannerContext",
+    "PlannerDependencyRequest",
+    "PlannerMode",
+    "PlanProvenance",
+    "ProjectTime",
+    "ResolvedEditingPlan",
+    "ResolvedPlanItem",
+    "ReusePolicy",
+    "SpatialAnchor",
+    "SpatialAnchorType",
+    "SpatialRelation",
+    "SpatialSpec",
+    "StyleSpec",
+    "SubReport",
+    "TemporalSpec",
+    "TimeAnchor",
+    "TimelineEffect",
+    "TimelineMapping",
+    "TimelineStructure",
+    "TimelineTrack",
+    "ToolCapabilityProfile",
+    "Transform",
+    "AnimationSpec",
+    "UnfulfilledRequirement",
+    "ValidationIssue",
+    "ValidationReport",
+    "ValidationStatus",
+    "__version__",
+]
