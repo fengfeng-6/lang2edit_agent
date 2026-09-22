@@ -16,6 +16,8 @@ from ..models import (
     SpatialSnapshot,
 )
 
+from gesture_intent.models import model_dump
+
 
 def to_intent_view(state: SemanticVideoState):
     """导出模块一 ``SemanticVideoView``（IntentParserInput.semantic_video_view）。
@@ -84,6 +86,14 @@ def _spatial_brief(snapshot: SpatialSnapshot) -> Dict[str, Any]:
         out["person_bbox"] = list(snapshot.person_bbox)
     if snapshot.head_center:
         out["head_center"] = list(snapshot.head_center)
+    # 手部点：模块三按 active_hands 组装单手 P1 保护区域（§32）
+    hands: Dict[str, Any] = {}
+    if snapshot.left_hand:
+        hands["left"] = list(snapshot.left_hand)
+    if snapshot.right_hand:
+        hands["right"] = list(snapshot.right_hand)
+    if hands:
+        out["hands"] = hands
     if snapshot.direction:
         out["direction"] = {"vector": list(snapshot.direction.vector), "label": snapshot.direction.label.value}
     if snapshot.protected_regions:
@@ -166,4 +176,6 @@ def build_semantic_view(
             "last_action": state.structural_state.last_action.event_ref if state.structural_state.last_action else None,
         },
         query_statuses=query_statuses,
+        subject_profile=model_dump(state.subject_profile),
+        state_version=state.version,
     )
