@@ -104,13 +104,42 @@ CASES = [
     ("今天天气真不错", "sticker", set(), set(), set()),
 ]
 
+#: 年龄偏大/残障用户语料：口语化、儿化叠词、碎片句、ASR 语气词、
+#: 感官诉求（怕晃眼/要大字/要亮堂）、方言自称、自我纠正、
+#: 词表外的老年高频意象（福/寿/牡丹/戏曲/广场舞）。
+ELDERLY_CASES = [
+    # —— 儿化/叠词/称呼 ——
+    ("给我弄个花儿，红的那种", "sticker", {"flower"}, {"red"}, set()),
+    ("小星星，要多来点闪的", "sticker", {"star"}, {"small", "glowing"}, set()),
+    ("孙女喜欢的卡哇伊贴画", "sticker", set(), {"cute"}, set()),
+    ("俺想要个大红的气球", "sticker", {"balloon"}, {"red", "big"}, set()),
+    # —— ASR 语气词/碎片句/自我纠正 ——
+    ("那个……嗯……爱心，粉的", "sticker", {"heart"}, {"pink"}, set()),
+    ("花。红的。大一点。", "sticker", {"flower"}, {"red", "big"}, set()),
+    ("鸟……不对不对，蝴蝶，要蓝的", "sticker", {"butterfly", ""}, {"blue"}, set()),
+    ("月亮……就是天上那个月亮", "sticker", {"moon"}, set(), set()),
+    # —— 视力退化诉求（低视力/老花/怕晃） ——
+    ("老花眼看不清，整大点的", "sticker", set(), {"big"}, set()),
+    ("眼睛怕晃，别整太闪的", "sticker", set(), set(), {"glowing", "sparkle"}),
+    ("亮堂点的背景，屋里暗", "background", {"", "background"}, {"bright"}, set()),
+    ("颜色深点明显点，别太艳", "sticker", set(), set(), set()),
+    # —— 听力/节奏诉求 ——
+    ("慢悠悠的歌，别吵", "music", {"", "music_note"}, {"calm"}, set()),
+    ("跳广场舞那种热闹曲子", "music", {"", "music_note"}, {"upbeat", "energetic"}, set()),
+    ("抒情一点的二胡曲子", "music", {"", "music_note"}, {"emotional"}, set()),
+    ("声音轻点的音乐，睡觉听", "music", {"", "music_note"}, {"calm"}, set()),
+    # —— 老年高频意象（词表外 → 回显或丢弃都合规） ——
+    ("过大寿用的，喜庆点", "sticker", set(), set(), set()),
+    ("牡丹花那种富贵的", "sticker", {"flower", ""}, set(), set()),
+    ("戏曲调调的背景音乐", "music", {"", "music_note"}, set(), set()),
+    ("福字贴纸，过年贴", "sticker", set(), set(), set()),
+    # —— 动作受限相关表述（与素材语义无关，须不编造） ——
+    ("手抖得厉害，图案简单点", "sticker", set(), {"minimal", "flat"}, set()),
+    ("轮椅上跳舞用的，素净点的", "sticker", set(), set(), set()),
+]
 
-@pytest.mark.parametrize(
-    "query,asset_type,objects,any_terms,negatives", CASES,
-    ids=[c[0] for c in CASES],
-)
-def test_live_rewrite(query, asset_type, objects, any_terms, negatives):
-    parsed = _parse(query, asset_type)
+
+def _check(parsed, query, objects, any_terms, negatives):
     assert _whitelist_ok(parsed, query), (
         f"白名单外泄: {parsed} raw={query!r}")
     if objects:
@@ -121,6 +150,22 @@ def test_live_rewrite(query, asset_type, objects, any_terms, negatives):
     for neg in negatives:
         assert neg in parsed.negative_terms, (
             f"negative_terms={parsed.negative_terms} 缺少 {neg}")
+
+
+@pytest.mark.parametrize(
+    "query,asset_type,objects,any_terms,negatives", CASES,
+    ids=[c[0] for c in CASES],
+)
+def test_live_rewrite(query, asset_type, objects, any_terms, negatives):
+    _check(_parse(query, asset_type), query, objects, any_terms, negatives)
+
+
+@pytest.mark.parametrize(
+    "query,asset_type,objects,any_terms,negatives", ELDERLY_CASES,
+    ids=[c[0] for c in ELDERLY_CASES],
+)
+def test_live_rewrite_elderly(query, asset_type, objects, any_terms, negatives):
+    _check(_parse(query, asset_type), query, objects, any_terms, negatives)
 
 
 def test_live_consistency_same_query_twice():
