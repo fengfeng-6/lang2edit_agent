@@ -32,6 +32,7 @@ dev = [
 gesture-intent = "gesture_intent.cli:main"
 video-understand = "video_understanding.cli:main"
 editing-planner = "editing_planner.cli:main"
+asset-manager = "asset_manager.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
