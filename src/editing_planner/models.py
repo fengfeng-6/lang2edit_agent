@@ -463,8 +463,11 @@ class AssetRequest(StrictModel):
     """
 
     request_uid: str  # asset_req_<asset_type>_<NN>
+    version: int = 1  # 需求修改升版本；模块四按 (uid, version) 管 Binding
     asset_type: str  # background / sticker / image / music / sound_effect（text 不外求 §35）
     media_type: str  # image / audio / video
+    resolution_mode: Optional[str] = None  # exact_reference / semantic_search；None 由模块四推导
+    source_ref: Optional[str] = None  # exact_reference 时的用户素材引用（文件名/序号/asset_uid）
     semantic_query: str = ""  # SemanticValue raw + canonical + tags 组装
     style_context: Dict[str, Any] = Field(default_factory=dict)
     technical_requirements: Dict[str, Any] = Field(default_factory=dict)
@@ -472,6 +475,7 @@ class AssetRequest(StrictModel):
     reuse_policy: ReusePolicy = ReusePolicy.reuse_same_asset
     source_policy: str = "any"  # any / user_provided / generated（预留）
     licensing_policy: str = "default"
+    search_strategy: Optional[str] = None  # first_satisfactory / best_available；None 按类型默认
     fallback_policy: str = "nearest_semantic"  # 给模块四的提示
     constraint_level: ConstraintLevel = ConstraintLevel.hard
     dedup_key: str = ""
