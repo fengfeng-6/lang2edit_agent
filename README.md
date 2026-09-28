@@ -14,7 +14,7 @@
 | 二、视频理解 | `video_understanding` | ✅ 已实现（核心链路 + 规则检测器；CV/音频重模型为可选适配器） | [docs/模块二-视频理解.md](docs/模块二-视频理解.md) |
 | 三、剪辑规划 | `editing_planner` | ✅ 已实现（两阶段 Plan + 无障碍校验 + LLM 创意接缝） | [docs/自然语言驱动视频剪辑 Agent——模块三：剪辑规划模块工程设计文档.md](docs/自然语言驱动视频剪辑%20Agent——模块三：剪辑规划模块工程设计文档.md) |
 | 四、素材搜索与管理 | `asset_manager` | ✅ 已实现（解析路由 + 三级 Provider + 检测/去重/过滤/排序 + Registry/Binding + LLM 查询改写接缝） | [docs/自然语言驱动视频剪辑 Agent——模块四：素材搜索与管理模块工程设计文档.md](docs/自然语言驱动视频剪辑%20Agent——模块四：素材搜索与管理模块工程设计文档.md) |
-| 五、剪辑工具执行 | `edit_executor`（预留名） | 未开始 | — |
+| 五、剪辑工具执行 | `edit_executor` | ✅ 已实现（Milestone 5.1 Executor Core + 5.2 Stateful Execution/MemoryBackend；JianYing 5.3 与 FFmpeg 资源 5.4 为接缝占位） | [docs/Module 5 剪辑工具执行模块设计文档.md](docs/Module%205%20剪辑工具执行模块设计文档.md) |
 | 六、反馈与持续修改 | `session_feedback`（预留名） | 未开始 | — |
 
 各模块为 `src/` 下的独立顶级包（setuptools 自动发现），模块间单向依赖：
@@ -31,9 +31,10 @@
 │   ├── gesture_intent/        # 模块一：自然语言需求理解
 │   ├── video_understanding/   # 模块二：视频理解（按 docs/模块二 §5 六能力划分子包）
 │   ├── editing_planner/       # 模块三：剪辑规划（两阶段 Plan + 无障碍策略）
-│   └── asset_manager/         # 模块四：素材搜索与管理（Provider/编译/Registry）
+│   ├── asset_manager/         # 模块四：素材搜索与管理（Provider/编译/Registry）
+│   └── edit_executor/         # 模块五：剪辑工具执行（Desired State + Diff + Revision）
 ├── tests/
-│   └── intent/            # 各模块测试按短名分目录（intent/、video/、planner/、asset_manager/），文件 basename 保持全局唯一
+│   └── intent/            # 各模块测试按短名分目录（intent/、video/、planner/、asset_manager/、executor/），文件 basename 保持全局唯一
 ├── data/                  # 素材/分析缓存（gitignore）
 └── workspace/             # 运行产物：state.json / history.jsonl / 输出工程（gitignore）
 ```
@@ -417,6 +418,80 @@ exact_reference 直查不触发搜索、无显式音乐需求不搜音乐、
 
 ---
 
+## 模块五：剪辑工具执行 `edit_executor`
+
+把模块三 `ResolvedEditingPlan` 落实为真实可编辑工程。核心模型是
+**Desired State + Diff + Revision**（设计文档 §4-§83）：Planner 的产物先编译成
+与后端无关的 `DesiredProjectGraph`（期望状态），再与当前已提交工程图做
+属性级 Diff，生成结构化 `EditOperation` DAG（不是字符串脚本）交给 Backend
+执行——同一份计划重放时全部 NOOP，改一个参数只产生对应的最小操作集。
+
+```text
+ExecutorInput → compile_graph → DesiredProjectGraph
+    → diff_graphs → build_patch (ExecutionPatch / EditOperation DAG)
+    → backend.execute → backend.verify → save → commit_candidate
+```
+
+- **编译器**（§22-§31）：InitProject → SourceMedia → 六条逻辑轨道预建
+  （`trk_<name>`，防对象悬空轨道引用）→ 各 Operation 编译器
+  （overlay/track_overlay/text/music/background/freeze…）→ 源时间线
+  （无 freeze 单 `tlobj_main_video`；有 freeze 按 source_time 交错切片 +
+  恒发 `tlobj_original_audio`，`freeze_audio_policy=silence` → mute_ranges）
+  → mutation 应用（target 解析链：plan_item_ref/event/video/audio_track/track，
+  未解析记 warning 不静默）→ asset MediaRef 解析 → keyframe 归一 →
+  object/graph fingerprint（排除 uid/provenance/backend ref）。
+- **身份稳定性**：`tlobj_<sha8(plan_item_uid, role)>`；切片内容派生
+  `tlobj_<sha8(src_slice,index,src_start,src_end)>`；系统对象定 uid
+  `tlobj_main_video` / `tlobj_original_audio`；执行号 `exe_<NNNNNN>`
+  扫 runs/ 目录分配（崩溃安全）。
+- **Revision 级原子性**（§57-§72）：每次 apply 写
+  `rev_NNNN/{manifest{candidate},graph,state}.json` → verify →
+  manifest 翻 committed → `backend_ref.json` → `current_graph.json` →
+  `current.json` → `state.json` 的顺序提交；中途崩溃留下未完成
+  candidate，下次启动 recover 隔离记录（不删文件），重试复用同一
+  revision 号覆盖提交。
+- **幂等与 dry_run**：相同计划再 apply → 全 NOOP →
+  `status=completed_noop`，revision 不变、不建 candidate；`dry_run`
+  返回完整 patch 但零副作用（不占 exe 号、无 lock/history/state 写入）。
+- **Preflight**（§85-87）：plan.validation 门 → source_media →
+  pending_dependency 项 → asset 检查 → mask/产物检查
+  （replace_background 缺 `foreground_subject_mask` 或
+  `preserve_mobility_device` 无主体标注 → blocking dependency）→
+  capability 对照 backend manifest——mismatch 直接
+  `capability_mismatch` 状态，绝不自动降级。
+- **Backend 接缝**（§40-§50）：`BackendProtocol` 全签名
+  （probe/describe_capabilities/begin_session/execute/verify/save/export）；
+  `MemoryBackend` 全量模拟（sim.json，13 项能力全 supported，
+  `capabilities_override` 可翻转任意能力、`fail_plan` 注入失败供
+  恢复测试）；`FFmpegBackend`/`jianying` 为 5.4/5.3 占位存根。
+- **EditView**（§75-76）：`get_edit_view` 输出面向模块六的编辑视图
+  （display_id、editable_properties 按 role 取表、current_properties）。
+
+```powershell
+edit-executor compile --input executor_input.json
+edit-executor apply --input executor_input.json --workspace ws --backend memory
+edit-executor inspect --workspace ws --project p1
+edit-executor revisions --workspace ws --project p1
+edit-executor edit-view --workspace ws --project p1
+```
+
+```python
+from edit_executor import EditingExecutor
+
+executor = EditingExecutor(workspace_root="ws")           # 默认 MemoryBackend
+graph = executor.compile(executor_input)                  # ExecutorInput → graph
+result = executor.apply(executor_input)                   # 全链：preflight→commit
+view = executor.get_edit_view("p1")                       # 模块六消费的编辑视图
+```
+
+九组验收场景（§94，见 `tests/executor/`）：双爱心首跑全 CREATE、
+改 scale 单 `set_transform` 其余 NOOP、换素材 `replace_media` uid 不变、
+删需求 DELETE、keyframes 能力缺失 → capability_mismatch 不降级、
+replace_background 缺蒙版 → blocking dep、freeze 交错切片、
+二跑全 NOOP/completed_noop、中败 candidate 隔离后恢复。
+
+---
+
 ## 测试
 
 ```powershell
@@ -450,6 +525,15 @@ LLM 越权输出白名单拦截。
 Registry/Binding/usage_index/alternatives 切换/Search Cache、
 Import Pipeline 复核拒收、依赖请求产出、顶层状态聚合、CLI 往返、
 §80-84 验收场景端到端、坐姿画像不改语义主题、真实 LLM 端点语料实测。
+
+覆盖（模块五，`tests/executor/`）：模型往返与 fingerprint 排除项、
+编译（overlay/text/music/effect、replace_background 双对象、系统对象）、
+源时间线（freeze 交错切片、silence→mute_ranges）、mutation 目标解析与
+replace_music 兜底、Diff（CREATE/UPDATE/DELETE/NOOP、replace_media
+保 uid）、apply 全链（rev/state/lock/索引/history+journal）、幂等重放
+completed_noop、崩溃恢复（中败隔离 candidate、重试复用 revision）、
+Preflight 各拒绝态、dry_run 零副作用、EditView 字段、跨重启状态一致、
+CLI 往返。
 
 新增模块的测试放在 `tests/<模块短名>/` 下（如 `tests/video/`），
 各目录内测试文件 basename 需全局唯一（pytest prepend 导入模式要求）。
