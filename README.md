@@ -490,6 +490,14 @@ view = executor.get_edit_view("p1")                       # 模块六消费的�
 replace_background 缺蒙版 → blocking dep、freeze 交错切片、
 二跑全 NOOP/completed_noop、中败 candidate 隔离后恢复。
 
+真实视频端到端实测（超算 Slurm，2026-09）：`test_video.mp4`（32.5s 手势舞，
+MediaPipe+librosa 真实分析）走通模块一~五全链——LLM 意图解析「每次比心
+时出现粉色爱心」→ 检出 4 次比心事件（profile 自动推断 seated）→ LLM
+规划产出贴纸 PlanItem + 素材请求 → 模块四导入并绑定真实 PNG 贴纸 →
+`apply` 提交 rev_0001，贴纸对象精确落在比心事件时间点
+（3.27–6.77s / 28.73–32.23s）。冒烟脚本在超算
+`it_stu100_home/e2e_real_video.py`，产物在 `workspace/e2e_real/`。
+
 ---
 
 ## 测试
