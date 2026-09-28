@@ -13,7 +13,7 @@
 | 一、自然语言需求理解 | `gesture_intent` | ✅ 已实现 | [docs/模块一-自然语言需求理解.md](docs/模块一-自然语言需求理解.md) |
 | 二、视频理解 | `video_understanding` | ✅ 已实现（核心链路 + 规则检测器；CV/音频重模型为可选适配器） | [docs/模块二-视频理解.md](docs/模块二-视频理解.md) |
 | 三、剪辑规划 | `editing_planner` | ✅ 已实现（两阶段 Plan + 无障碍校验 + LLM 创意接缝） | [docs/自然语言驱动视频剪辑 Agent——模块三：剪辑规划模块工程设计文档.md](docs/自然语言驱动视频剪辑%20Agent——模块三：剪辑规划模块工程设计文档.md) |
-| 四、素材搜索与管理 | `asset_manager`（预留名） | 未开始 | — |
+| 四、素材搜索与管理 | `asset_manager` | ✅ 已实现（解析路由 + 三级 Provider + 检测/去重/过滤/排序 + Registry/Binding + LLM 查询改写接缝） | [docs/自然语言驱动视频剪辑 Agent——模块四：素材搜索与管理模块工程设计文档.md](docs/自然语言驱动视频剪辑%20Agent——模块四：素材搜索与管理模块工程设计文档.md) |
 | 五、剪辑工具执行 | `edit_executor`（预留名） | 未开始 | — |
 | 六、反馈与持续修改 | `session_feedback`（预留名） | 未开始 | — |
 
@@ -29,9 +29,11 @@
 ├── examples/              # 示例输入（request.json 等）
 ├── src/
 │   ├── gesture_intent/        # 模块一：自然语言需求理解
-│   └── video_understanding/   # 模块二：视频理解（按 docs/模块二 §5 六能力划分子包）
+│   ├── video_understanding/   # 模块二：视频理解（按 docs/模块二 §5 六能力划分子包）
+│   ├── editing_planner/       # 模块三：剪辑规划（两阶段 Plan + 无障碍策略）
+│   └── asset_manager/         # 模块四：素材搜索与管理（Provider/编译/Registry）
 ├── tests/
-│   └── intent/            # 各模块测试按短名分目录（intent/、video/…），文件 basename 保持全局唯一
+│   └── intent/            # 各模块测试按短名分目录（intent/、video/、planner/、asset_manager/），文件 basename 保持全局唯一
 ├── data/                  # 素材/分析缓存（gitignore）
 └── workspace/             # 运行产物：state.json / history.jsonl / 输出工程（gitignore）
 ```
@@ -328,6 +330,93 @@ editing-planner replan --existing plan.json --intent intent.json --patch patch.j
 
 ---
 
+## 模块四：素材搜索与管理 `asset_manager`
+
+消费模块三 `LogicalEditingPlan.asset_requests`（`AssetRequest[]`），输出
+`AssetResolutionResult`：每条请求解析为一个 `BindingRecord` +
+交付模块三 materialize 的 `AssetBinding`，或带原因的 `unresolved`。
+模块四**不修改 Plan**（§73）；音乐候选缺 BPM/时长时产出
+`AssetDependencyRequest`（`audio_analysis`）交 Agent Controller 调度模块二（§47/§84）。
+
+### 解析链路（§8/§14）
+
+```text
+exact_reference  → user/local 直查 → inspect → register → bind        （§82）
+semantic_search  → policy 归一 → 有序 Provider 集 + 能力过滤（§12/§18）
+                 → Query Compiler → 召回 → normalize → inspect → dedup
+                 → Hard Filter → Ranking → 选中 → Import Pipeline
+                 → Registry → Binding                                  （§14）
+```
+
+- **解析路由**：显式 `resolution_mode` 优先；`source_ref` 或
+  `source_policy=user_provided` 走 `exact_reference`（文件名/序号引用直查，
+  不做语义搜索），其余走 `semantic_search`。
+- **三级 Provider**：`user`（项目 Registry 中已导入的用户素材）、
+  `local`（`data/asset_library/manifest.json` 索引的本地库，不运行时扫描）、
+  `online`（`ASSET_ONLINE_SOURCES` JSON 配置的通用 HTTP JSON adapter——
+  搜索只取 metadata/预览，仅选中候选才下载原文件 §24；
+  音乐检索仅走 `authorized_for_music` 的源 §46）。
+- **Source Policy**（§12/§46）：`user_only / local_only / user_first /
+  local_first / online_allowed`（模块三的 `any`/`user_provided` 自动归一）；
+  `generated` 不支持生成式素材（§5）；`offline=True` 收紧为 `local_only`。
+- **两种检索策略**（§13）：`first_satisfactory` 逐源检索、首个产出可过
+  Hard Filter 的候选即停；`best_available` 全部允许源召回后统一排序。
+  缺省按类型：sticker/image → first_satisfactory，其余 → best_available。
+- **Query Compiler**（§15-16）：输入仅限 `semantic_query` +
+  `style_context` + `technical_requirements`，不重新阅读聊天历史；
+  默认中英词表改写（`LexiconQueryRewriter`），LLM 走 `QueryRewriter`
+  接缝（`ASSET_LLM_*` 启用）且输出过白名单校验，不允许无依据加词。
+- **检测与筛选**：本地可读文件做真实检测（格式/尺寸/alpha/时长/hash），
+  在线候选标记未验证；`technical_requirements` 拆 required/preferred——
+  required 进 Hard Filter，preferred 只进 Ranking（§11/§37）。
+- **透明加权排序**（§32-44）：`S = ws·semantic + wt·technical + wv·visual
+  + wl·license + wu·usage`，五维权重按 asset_type 区分；
+  坐姿/无障碍画像只改 usage 偏好（紧凑、避让、低杂度），
+  不往 Query 里塞 wheelchair/disabled（§40/§71）。
+- **Import 复核与重试**：下载后实测复核——声称 alpha 实际无 → 拒收（§42）；
+  失败沿 ranked 顺序重试至多 3 次，`fallback_used` 记录是否用了备选。
+- **Registry / Binding**：项目级 AssetRegistry 统一登记
+  （`scope=project`），`usage_index` 按 plan_item 记素材使用；
+  Binding 留存 Top-3 alternatives，`switch_alternative` "换一个"
+  直接用候选池切换，不重新联网搜（§50/§85）；在线检索结果进
+  Search Cache（§69）。
+- **顶层状态**：`resolved / resolved_with_warnings / partial / failed`——
+  hard 约束未解才计 failed/partial，soft 未解只 warning（§68）。
+
+### 用法
+
+```powershell
+asset-manager resolve --requests reqs.json --project p1 --pretty
+asset-manager import --file x.png --project p1 --caption "我的贴纸" --tag 爱心
+asset-manager switch --request asset_req_sticker_01 --project p1   # 换备选
+asset-manager state --project p1                                   # 项目素材状态
+```
+
+```python
+from asset_manager import AssetManager
+
+mgr = AssetManager(project_id="p1")
+result = mgr.resolve_assets(plan.asset_requests)   # AssetRequest[] → bindings
+record = mgr.import_user_asset("x.png", caption="我的贴纸", tags=["爱心"])
+binding = mgr.switch_alternative("asset_req_sticker_01")
+```
+
+| 环境变量 | 说明 | 默认 |
+|---|---|---|
+| `ASSET_LLM_API_KEY` / `OPENAI_API_KEY` | 设置后启用 LLM 查询改写 | 无（词表改写） |
+| `ASSET_LLM_BASE_URL` / `OPENAI_BASE_URL` | OpenAI-compatible 服务地址 | `https://models.sjtu.edu.cn/api/v1` |
+| `ASSET_LLM_MODEL` / `OPENAI_MODEL` | 模型名 | `deepseek-reasoner` |
+| `ASSET_LLM_RESPONSE_FORMAT` | `json_object` 或 `json_schema` | `json_object` |
+| `ASSET_LLM_TIMEOUT` | 请求超时（秒） | `60` |
+| `ASSET_ONLINE_SOURCES` | 在线源 JSON 数组配置（adapter_id/endpoint/asset_types/authorized_for_music/headers…） | 无（不在线搜） |
+
+验收场景（§80-84，见 `tests/asset_manager/test_asset_scenario*.py`）：
+本地贴纸 first_satisfactory 链路、背景 best_available 多源合并排序、
+exact_reference 直查不触发搜索、无显式音乐需求不搜音乐、
+音乐候选缺 metadata 产出 `audio_analysis` 依赖请求。
+
+---
+
 ## 测试
 
 ```powershell
@@ -352,6 +441,15 @@ not_found/failed 区分、空间快照与轨迹、音频事件物化、结构化
 跟随/震颤/单手锚点、能力降级矩阵（§58）、无障碍校验十项、
 §56-60 五个验收场景端到端、PlanPatch 局部重规划、save/load、CLI 往返、
 LLM 越权输出白名单拦截。
+
+覆盖（模块四，`tests/asset_manager/`）：模型往返与校验、Resolution Router
+（exact_reference vs semantic_search 路由与暗示）、Source Policy 归一/
+别名/offline 收紧/generated 拒绝、Provider 能力过滤、Query Compiler
+（词表改写、required/preferred 拆分、负词、LLM 改写接缝与白名单）、
+候选管线（normalize/inspect/dedup/hard filter/rank/选用分）、
+Registry/Binding/usage_index/alternatives 切换/Search Cache、
+Import Pipeline 复核拒收、依赖请求产出、顶层状态聚合、CLI 往返、
+§80-84 验收场景端到端、坐姿画像不改语义主题、真实 LLM 端点语料实测。
 
 新增模块的测试放在 `tests/<模块短名>/` 下（如 `tests/video/`），
 各目录内测试文件 basename 需全局唯一（pytest prepend 导入模式要求）。
