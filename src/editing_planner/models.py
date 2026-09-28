@@ -628,6 +628,15 @@ class ResolvedPlanItem(StrictModel):
     follow: Optional[Dict[str, Any]] = None
     # {target, mode, smoothing, keyframes:[{t,x,y}] 或 trajectory_ref}
     parameters: Dict[str, Any] = Field(default_factory=dict)
+    resolved_capability: Optional[str] = None
+    # §92.1：PlanItem 能力解析结果透传，Executor 不重新推断
+    target: Dict[str, Any] = Field(default_factory=dict)
+    # §92.2：{type: event|track|video|audio_track|plan_item_ref, value: ...}
+    # mutation（scale/position/volume_adjust、replace_music）的修改目标
+    freeze_audio_policy: Optional[str] = None
+    # §92.3：continue / silence / hold（仅 freeze 项）
+    source_time: Optional[float] = None
+    # freeze 锚定的源时刻（materialize 已解析 anchor_time，此处透传给模块五）
     source_requirement_ids: List[str] = Field(default_factory=list)
     degradation_applied: List[str] = Field(default_factory=list)
     status: PlanItemStatus = PlanItemStatus.planned

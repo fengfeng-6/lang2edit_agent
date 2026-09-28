@@ -89,6 +89,7 @@ def materialize_plan(
 
     # ---- 2. freeze 移位表 ----
     shifts: List[Dict[str, float]] = []
+    anchor_by_uid: Dict[str, float] = {}
     for item in plan.plan_items:
         if item.status in _INACTIVE:
             continue
@@ -100,6 +101,7 @@ def materialize_plan(
             continue
         delta = _duration_value(item, 0.0)
         item.temporal_spec.source_time_hint = anchor_time
+        anchor_by_uid[item.plan_item_uid] = anchor_time
         if delta > 0:
             shifts.append({"from_source_time": anchor_time, "delta": delta})
     shifts.sort(key=lambda s: s["from_source_time"])
@@ -128,6 +130,14 @@ def materialize_plan(
             binding = binding_map.get(item.asset_request_ref)
             asset_uid = binding.asset_uid if binding else None
 
+        parameters = dict(item.parameters)
+        if (
+            item.operation == PlanOperation.replace_background
+            and getattr(profile, "preserve_mobility_device", False)
+        ):
+            # §92：无障碍背景替换标志透传给模块五的 preflight 门径
+            parameters["preserve_mobility_device"] = True
+
         resolved.append(ResolvedPlanItem(
             plan_item_uid=item.plan_item_uid,
             plan_key=item.plan_key,
@@ -140,7 +150,15 @@ def materialize_plan(
                 params=dict(item.style_spec.animation_params),
             ),
             follow=follow,
-            parameters=dict(item.parameters),
+            parameters=parameters,
+            resolved_capability=item.resolved_capability,
+            target=dict(item.target),
+            freeze_audio_policy=(
+                item.parameters.get("freeze_audio_policy")
+                if item.operation == PlanOperation.freeze
+                else None
+            ),
+            source_time=anchor_by_uid.get(item.plan_item_uid),
             source_requirement_ids=list(item.source_requirement_ids),
             degradation_applied=list(item.degradation_applied),
             status=item.status,

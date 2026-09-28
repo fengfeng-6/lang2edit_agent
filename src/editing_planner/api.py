@@ -702,10 +702,11 @@ class EditingPlanner:
     ) -> Optional[PlanItem]:
         """freeze → insert_duration 项；锚定 ending_pose/last_action/video_end。"""
         duration = freeze_duration(op.parameters) or 1.0
+        audio_policy = op.parameters.get("freeze_audio_policy") or "continue"
         target_value = op.target.value
         item = self._new_item(
             op.id, None, PlanOperation.freeze, op.source_text,
-            parameters={"duration": duration},
+            parameters={"duration": duration, "freeze_audio_policy": audio_policy},
             requirement_hash=op_hash,
         )
         structure_keys = {"video_start", "video_end", "first_action", "last_action"}
