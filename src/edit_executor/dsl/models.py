@@ -130,6 +130,11 @@ class ExportResult(StrictModel):
     message: str = ""
 
 
+import sys as _sys  # noqa: E402
+
 from ..models import ExecutionPatch  # noqa: E402
 
-ExecutionPatch.update_forward_refs(EditOperation=EditOperation)
+# update_forward_refs 按 cls.__module__ 的 globals 解析 ForwardRef；
+# pydantic 1.10/2.13 对关键字 localns 兼容性不一，注入模块命名空间最稳。
+_sys.modules[ExecutionPatch.__module__].EditOperation = EditOperation
+ExecutionPatch.update_forward_refs()
