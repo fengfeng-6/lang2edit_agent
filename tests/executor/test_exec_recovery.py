@@ -58,10 +58,14 @@ def test_recovery_quarantines_candidate_then_recovers(tmp_path):
     executor2 = make_executor(tmp_path, backend=good)
     result2 = executor2.apply(_input(tmp_path))
     assert result2.status == ExecutionStatus.completed.value
-    # candidate 被隔离提示，rev_0002 正常提交
-    report = executor2.inspect(PROJECT)
-    assert any("rev_0001" in q for q in report["recovery"]["quarantined"])
-    assert executor2.get_revision(PROJECT) == 2
+    # recover 在 apply 前记录 candidate 隔离；新执行复用 rev_0001 并正常提交
+    assert any("rev_0001" in w for w in result2.warnings)
+    assert result2.revision == 1
+    manifest = json.loads(
+        (store.revision_dir(1) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["state"] == "committed"
+    assert executor2.get_revision(PROJECT) == 1
 
 
 def test_orphan_candidate_recovery(tmp_path):

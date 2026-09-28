@@ -169,14 +169,16 @@ class ExecutionStateManager:
         )
 
 
-_EDITABLE_BY_TYPE = {
+_EDITABLE_BY_ROLE = {
     "overlay": ["scale", "position", "asset", "animation"],
     "effect": ["scale", "position", "animation"],
     "text": ["content", "position", "scale", "animation"],
-    "audio": ["asset", "volume", "time_range"],
+    "music": ["asset", "volume", "time_range"],
+    "sound_effect": ["asset", "volume", "time_range"],
     "foreground_subject": ["mask"],
-    "freeze": ["duration"],
+    "freeze_frame": ["duration"],
     "source_slice": ["time_range"],
+    "main_video": ["time_range"],
     "background": ["asset", "time_range"],
 }
 
@@ -202,7 +204,7 @@ def _editable_view(obj) -> EditableObjectView:
     if obj.animation is not None:
         current["animation"] = obj.animation.semantic_type
     editable = (
-        [] if obj.origin == "system" else _EDITABLE_BY_TYPE.get(obj.object_type, [])
+        [] if obj.origin == "system" else _EDITABLE_BY_ROLE.get(obj.role, [])
     )
     return EditableObjectView(
         object_uid=obj.timeline_object_uid,

@@ -59,9 +59,11 @@ def compile_graph(executor_input: ExecutorInput) -> DesiredProjectGraph:
     _create_source_media(ctx)
     _create_logical_tracks(ctx)
     _compile_items(ctx)
+    # 源时间线必须先于 mutation：volume/scale/position 的目标
+    # （main_video / 切片 / original_audio）是系统对象，此刻才存在。
+    _build_source_timeline(ctx)
     _apply_mutations(ctx)
     _resolve_asset_media_refs(ctx)
-    _build_source_timeline(ctx)
     _normalize_keyframes(ctx)
     _compute_fingerprints(ctx)
     # 编译期产物缺口（蒙版/轨迹缺失）随 graph.warnings 透出；
