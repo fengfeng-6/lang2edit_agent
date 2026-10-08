@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -105,7 +106,14 @@ class FeedbackSession:
             )
         state = SessionState(project_id=self.project_id, turn=0)
         try:
-            analysis = self.vu.analyze_video(video)
+            # VU 分析（CPU/CV）与首轮 parse（LLM 网络）互不依赖——
+            # parse 输入只有 utterance，subject_profile 在 join 后才取
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                analysis_fut = pool.submit(self.vu.analyze_video, video)
+                output = self.parser.parse(
+                    IntentParserInput(user_utterance=utterance)
+                )
+                analysis = analysis_fut.result()
             state.video_id = getattr(analysis.video, "video_id", "") or ""
             state.source_uri = source_uri or _source_uri_of(video, analysis)
             if self.accessibility_profile is None:
@@ -113,7 +121,6 @@ class FeedbackSession:
                 self.accessibility_profile = getattr(
                     getattr(self.vu, "state", None), "subject_profile", None
                 )
-            output = self.parser.parse(IntentParserInput(user_utterance=utterance))
             intent = output.editing_intent or EditingIntent()
             self._absorb_queries(state, output.required_video_queries)
             view = self._semantic_view(state)

@@ -17,6 +17,7 @@ from gesture_intent.models import (
     Constraint,
     EditingIntent,
     IntentPatch,
+    ObjectType,
     OperationType,
     model_dump,
     model_validate,
@@ -196,8 +197,48 @@ def build_plan_patch(
         raise ValueError("replan 需要 semantic_view 以展开需求（§52）")
 
     if needs_replan:
+        # 只把变更需求喂给 plan()——全量 intent 会让 Creative LLM 每轮
+        # 为所有需求重新创作（上下文大、抖动面大），而过滤逻辑
+        # 本就只保留 changed 项。两类宿主必须随行：
+        # 1) 目标落在 scope 内的持久 op——否则载体项重发射后
+        #    _apply_adjust 不再运行，scale/remove 效果被回滚；
+        # 2) music 需求——api.py 的 has_music 开关影响事件项生成，
+        #    scope 外置会让已变更需求产出不同结果。
+        scope_ids = set(changed)
+        for o in intent.explicit_operations:
+            if o.id in changed:
+                for item in _op_targets(o, plan.plan_items):
+                    scope_ids.update(item.source_requirement_ids)
+        scope_ids.update(
+            r.id
+            for r in intent.object_requirements
+            if r.object_type == ObjectType.music
+        )
+        for o in intent.explicit_operations:
+            if o.id in scope_ids:
+                continue
+            if any(
+                rid in scope_ids
+                for item in _op_targets(o, plan.plan_items)
+                for rid in item.source_requirement_ids
+            ):
+                scope_ids.add(o.id)
+        scoped_intent = EditingIntent(
+            global_intent=intent.global_intent,
+            object_requirements=[
+                r for r in intent.object_requirements if r.id in scope_ids
+            ],
+            event_bound_requirements=[
+                r for r in intent.event_bound_requirements if r.id in scope_ids
+            ],
+            explicit_operations=[
+                o for o in intent.explicit_operations if o.id in scope_ids
+            ],
+            constraints=list(intent.constraints),
+            unresolved=list(intent.unresolved),
+        )
         input_model = EditingPlannerInput(
-            editing_intent=intent,
+            editing_intent=scoped_intent,
             semantic_view=view,
             accessibility_profile=accessibility_profile,
             tool_capabilities=tool_capabilities or ToolCapabilityProfile(),

@@ -422,3 +422,29 @@ def test_collapse_replace_skips_non_replace_adds():
         "obj_req_01", "obj_req_02"]
     assert not out.update_object_requirements
     assert not notes
+
+
+def test_start_parallelizes_analysis_and_parse(tmp_path, monkeypatch):
+    """start 的 VU 分析（CPU/CV）与首轮 parse（LLM/网络）并行——
+    parse 输入只有 utterance；墙钟应接近 max 而非 sum。"""
+    import time
+
+    session = make_session(tmp_path)
+
+    def _slow(fn, secs):
+        def _w(*a, **kw):
+            time.sleep(secs)
+            return fn(*a, **kw)
+        return _w
+
+    monkeypatch.setattr(
+        session.vu, "analyze_video", _slow(session.vu.analyze_video, 0.5))
+    monkeypatch.setattr(
+        session.parser, "parse", _slow(session.parser.parse, 0.5))
+
+    t0 = time.perf_counter()
+    result = session.start(make_source_video(tmp_path), START_UTTERANCE)
+    wall = time.perf_counter() - t0
+
+    assert result.status == FeedbackStatus.applied, result.message
+    assert wall < 0.9, f"串行下界 ~1.0s，实测 {wall:.2f}s 说明未并行"
