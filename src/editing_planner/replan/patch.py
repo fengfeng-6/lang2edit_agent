@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Set
 
 from gesture_intent.models import (
+    Constraint,
     EditingIntent,
     IntentPatch,
     OperationType,
@@ -34,6 +35,16 @@ from ..models import (
 
 #: 复用判定时忽略的子字段（创作抖动与 provenance 不算结构变化）
 _VOLATILE_FIELDS = {"style_spec", "provenance", "asset_request_ref", "status"}
+
+#: 依附型操作：只修改/删除已有项，永不拥有自己的 PlanItem。
+#: 这类 op 常驻 intent.explicit_operations，若按"无旧项=changed"判定
+#: 会让每个持久 op 每轮都强制全量重规划（LLM 抖动 × N）。
+_PATCH_LEVEL_OPS = {
+    OperationType.scale_adjust,
+    OperationType.position_adjust,
+    OperationType.replace_text,
+    OperationType.remove,
+}
 
 
 def _structural_dump(item: PlanItem) -> Dict[str, Any]:
@@ -87,22 +98,53 @@ def build_plan_patch(
     out.remove_plan_item_uids = sorted(removed_uids)
 
     # ---- 变更检测：内容哈希不一致的需求需要重规划 ----
+    op_by_id = {o.id: o for o in intent.explicit_operations}
+    adjusted_ops = {
+        rule[len("adjusted_by:"):]
+        for item in plan.plan_items
+        for rule in item.provenance.rules
+        if rule.startswith("adjusted_by:")
+    }
     changed: Set[str] = set()
     for rid, req in new_reqs.items():
         old_items = old_by_req.get(rid)
         if not old_items:
+            if isinstance(req, Constraint):
+                # 约束不拥有 PlanItem：任一宿主项的 cstr 哈希一致即未变更
+                if _constraint_unchanged(req, plan.plan_items):
+                    continue
+            else:
+                op = op_by_id.get(rid)
+                if op is not None and op.operation in _PATCH_LEVEL_OPS:
+                    # 已被打到项上（adjusted_by 标记）或当前无可解析
+                    # 目标 → 效果已固化/无法生效，不视为变更
+                    if rid in adjusted_ops or not _op_targets(
+                        op, plan.plan_items
+                    ):
+                        continue
             changed.add(rid)
             continue
         old_hash = _req_hash_of(old_items[0])
         if old_hash != short_hash(req)[:8]:
             changed.add(rid)
 
-    # 约束不走自己的 PlanItem——变更沿 constraint_refs 传播到宿主需求
-    for cid in {r for r in changed if r.startswith("constraint")} | (
-        set(patch.remove_constraint_ids) if patch else set()
-    ):
+    # 约束不走自己的 PlanItem——变更沿 constraint_refs 传播到宿主需求；
+    # 新增约束（旧项还没有它的 ref）按适用面 _constraint_applies 找宿主
+    constraint_changed = {
+        rid for rid in changed
+        if isinstance(new_reqs.get(rid), Constraint)
+    }
+    if patch:
+        constraint_changed |= set(patch.remove_constraint_ids)
+    for cid in constraint_changed:
+        constraint = next(
+            (c for c in intent.constraints if c.id == cid), None
+        )
         for item in plan.plan_items:
-            if cid in item.constraint_refs:
+            hit = cid in item.constraint_refs
+            if not hit and constraint is not None:
+                hit = _constraint_hit(constraint, item)
+            if hit:
                 for rid in item.source_requirement_ids:
                     changed.add(rid)
     # 被删除的显式操作同理：曾打到项上的 adjusted_by 需要重规划回滚
@@ -114,21 +156,33 @@ def build_plan_patch(
                         if rid != oid:
                             changed.add(rid)
 
-    # ---- 显式操作中对已有项的修改（§60 路径）----
-    # 先解析 patch 里 scale/position/replace_text 的目标项——这些不经过
-    # 全量重规划，直接克隆旧项打参数补丁。
+    # ---- 显式操作中对已有项的修改/删除（§60 路径）----
+    # 先解析 patch 里 scale/position/replace_text/remove 的目标项——不经
+    # 全量重规划：调整类克隆旧项打参数补丁，删除类直接进 remove 列表。
     touched: Set[str] = set()
     if patch is not None:
         for op in list(patch.add_operations) + list(patch.update_operations):
+            if op.operation == OperationType.volume_adjust:
+                # 克隆路径写的 volume_offset 是死参数——executor 只认独立
+                # volume item 的 delta_db；留给全量重规划生成
+                continue
             targets = _op_targets(op, plan.plan_items)
             if not targets:
+                continue
+            if op.operation == OperationType.remove:
+                for item in targets:
+                    touched.add(item.plan_item_uid)
+                    if item.plan_item_uid not in removed_uids:
+                        removed_uids.add(item.plan_item_uid)
+                        out.remove_plan_item_uids.append(item.plan_item_uid)
+                changed.discard(op.id)
                 continue
             for item in targets:
                 clone = model_validate(PlanItem, model_dump(item))
                 _apply_op_to_item(op, clone)
                 touched.add(clone.plan_item_uid)
                 out.update_plan_items.append(clone)
-                changed.discard(op.id)  # 操作本身不再需要全量项
+            changed.discard(op.id)  # 操作本身不再需要全量项
         # patch 里的删除直接映射
         for rid in patch.remove_object_requirement_ids + patch.remove_event_bound_requirement_ids:
             for item in old_by_req.get(rid, []):
@@ -165,6 +219,11 @@ def build_plan_patch(
                 out.add_plan_items.append(ni)
             elif _structural_dump(ni) != _structural_dump(old):
                 # 保留旧 uid（plan_key 相同 → uid 本就相同）+ 新内容
+                ni.plan_item_uid = old.plan_item_uid
+                out.update_plan_items.append(ni)
+            elif _cstr_tags(ni) != _cstr_tags(old):
+                # 结构一致但约束哈希过期（约束内容变了、项结构未变）——
+                # 刷新 provenance 让下轮判为 unchanged
                 ni.plan_item_uid = old.plan_item_uid
                 out.update_plan_items.append(ni)
             # 结构一致 → 复用旧项（不进补丁，LLM 抖动被挡住）
@@ -258,6 +317,23 @@ def _op_targets(op, items: List[PlanItem]) -> List[PlanItem]:
     return _resolve_target_items(op.target, items)
 
 
+def _constraint_unchanged(constraint: Constraint, items: List[PlanItem]) -> bool:
+    tag = f"cstr:{constraint.id}:{short_hash(model_dump(constraint))[:8]}"
+    return any(tag in i.provenance.rules for i in items)
+
+
+def _constraint_hit(constraint: Constraint, item: PlanItem) -> bool:
+    from ..api import _constraint_applies  # 延迟导入打破 api↔replan 环
+
+    return _constraint_applies(
+        constraint, item, str((constraint.scope or {}).get("target") or "")
+    )
+
+
+def _cstr_tags(item: PlanItem) -> Set[str]:
+    return {r for r in item.provenance.rules if r.startswith("cstr:")}
+
+
 def _apply_op_to_item(op, item: PlanItem) -> None:
     """把显式操作打到克隆项上（与 api._apply_adjust 同语义）。"""
     if op.operation == OperationType.scale_adjust:
@@ -276,8 +352,6 @@ def _apply_op_to_item(op, item: PlanItem) -> None:
     elif op.operation == OperationType.replace_text:
         if op.parameters.get("value") is not None:
             item.parameters["text"] = op.parameters["value"]
-    elif op.operation == OperationType.volume_adjust:
-        item.parameters["volume_offset"] = op.parameters
     item.provenance.rules.append(f"adjusted_by:{op.id}")
     if op.id not in item.source_requirement_ids:
         item.source_requirement_ids.append(op.id)

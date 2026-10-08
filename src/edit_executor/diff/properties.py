@@ -57,7 +57,10 @@ def compute_property_diff(
             PropertyChange(
                 property="media_ref",
                 op_type=EditOpType.replace_media.value,
-                arguments={"media_ref": new.media_ref},
+                arguments={
+                    "media_ref": new.media_ref,
+                    "asset_uid": new.asset_uid,
+                },
             )
         )
     if old.project_time != new.project_time:
