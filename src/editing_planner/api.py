@@ -142,6 +142,15 @@ _ASSET_BACKED_OPS = {
     PlanOperation.track_overlay,
 }
 
+#: executor 侧按 target/role 就地修改的 operation（与 compiler/mutations.py
+#: MUTATION_OPERATIONS 对齐）——object 需求产出的 mutation 项不挂 video 目标
+_MUTATION_OPS = {
+    PlanOperation.scale_adjust,
+    PlanOperation.position_adjust,
+    PlanOperation.volume_adjust,
+    PlanOperation.replace_music,
+}
+
 
 class EditingPlanner:
     """模块三门面。所有入口接受模型或 dict（与模块二 api 同惯例）。"""
@@ -541,7 +550,10 @@ class EditingPlanner:
                         type=SpatialAnchorType.spatial_track, target=target
                     )
                     item.spatial_spec.follow = FollowSpec(enabled=True, mode="trajectory", **policy)
-            item.target = {"type": "video", "value": "main_video"}
+            if item.operation not in _MUTATION_OPS:
+                # mutation 项不能带 video 目标——executor 会按 target 把
+                # asset_uid 覆写到主视频对象；留空走 role 默认分支
+                item.target = {"type": "video", "value": "main_video"}
             if directive:
                 item.style_spec = directive
             item.degradation_policy = degradation_policy_for(
@@ -682,7 +694,24 @@ class EditingPlanner:
                 }
                 out.append(item)
                 continue
-            # trim/split/remove/speed_adjust/replace_*：超出 MVP（§13 保留）
+            if op.operation == OperationType.remove:
+                # 实例级删除（"把第二个爱心删掉"）：目标解析到已有项 → 剔除；
+                # 未解析 → 维持 remove_segment + unsupported（§13 保留）
+                targets = _resolve_target_items(op.target, items)
+                if targets:
+                    dead = {i.plan_item_uid for i in targets}
+                    items[:] = [i for i in items if i.plan_item_uid not in dead]
+                    continue
+                item = self._new_item(
+                    op.id, None, PlanOperation.remove_segment, op.source_text,
+                    requirement_hash=op_hash,
+                )
+                item.status = PlanItemStatus.unsupported
+                item.target = {"type": op.target.type, "value": op.target.value}
+                warnings.append(f"{op.id}: remove 目标 '{op.target.value}' 未解析到已有 PlanItem")
+                out.append(item)
+                continue
+            # trim/split/speed_adjust/replace_*：超出 MVP（§13 保留）
             mapped = _OP_MAP.get(op.operation, PlanOperation.trim)
             item = self._new_item(
                 op.id, None, mapped, op.source_text, requirement_hash=op_hash
@@ -778,6 +807,10 @@ class EditingPlanner:
                     continue
                 if constraint.id not in item.constraint_refs:
                     item.constraint_refs.append(constraint.id)
+                    # cstr 内容哈希进 provenance——replan 据此判定约束未变更
+                    item.provenance.rules.append(
+                        f"cstr:{constraint.id}:{short_hash(model_dump(constraint))[:8]}"
+                    )
                 if item.spatial_spec is not None:
                     if constraint.type == "avoid_overlap" and constraint.reference:
                         region = {

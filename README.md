@@ -15,7 +15,7 @@
 | 三、剪辑规划 | `editing_planner` | ✅ 已实现（两阶段 Plan + 无障碍校验 + LLM 创意接缝） | [docs/自然语言驱动视频剪辑 Agent——模块三：剪辑规划模块工程设计文档.md](docs/自然语言驱动视频剪辑%20Agent——模块三：剪辑规划模块工程设计文档.md) |
 | 四、素材搜索与管理 | `asset_manager` | ✅ 已实现（解析路由 + 三级 Provider + 检测/去重/过滤/排序 + Registry/Binding + LLM 查询改写接缝） | [docs/自然语言驱动视频剪辑 Agent——模块四：素材搜索与管理模块工程设计文档.md](docs/自然语言驱动视频剪辑%20Agent——模块四：素材搜索与管理模块工程设计文档.md) |
 | 五、剪辑工具执行 | `edit_executor` | ✅ 已实现（Milestone 5.1 Executor Core + 5.2 Stateful Execution/MemoryBackend；JianYing 5.3 与 FFmpeg 资源 5.4 为接缝占位） | [docs/Module 5 剪辑工具执行模块设计文档.md](docs/Module%205%20剪辑工具执行模块设计文档.md) |
-| 六、反馈与持续修改 | `session_feedback`（预留名） | 未开始 | — |
+| 六、反馈与持续修改 | `session_feedback` | ✅ 已实现（首轮编排 + 反馈闭环 + 换一个 fast-path + Undo/Redo） | [docs/模块六-反馈与持续修改.md](docs/模块六-反馈与持续修改.md) |
 
 各模块为 `src/` 下的独立顶级包（setuptools 自动发现），模块间单向依赖：
 下游可 import 上游包的数据模型（如模块二消费模块一的 `required_video_queries`），
@@ -32,9 +32,10 @@
 │   ├── video_understanding/   # 模块二：视频理解（按 docs/模块二 §5 六能力划分子包）
 │   ├── editing_planner/       # 模块三：剪辑规划（两阶段 Plan + 无障碍策略）
 │   ├── asset_manager/         # 模块四：素材搜索与管理（Provider/编译/Registry）
-│   └── edit_executor/         # 模块五：剪辑工具执行（Desired State + Diff + Revision）
+│   ├── edit_executor/         # 模块五：剪辑工具执行（Desired State + Diff + Revision）
+│   └── session_feedback/      # 模块六：反馈与持续修改（会话编排 + Undo/Redo）
 ├── tests/
-│   └── intent/            # 各模块测试按短名分目录（intent/、video/、planner/、asset_manager/、executor/），文件 basename 保持全局唯一
+│   └── intent/            # 各模块测试按短名分目录（intent/、video/、planner/、asset_manager/、executor/、feedback/），文件 basename 保持全局唯一
 ├── data/                  # 素材/分析缓存（gitignore）
 └── workspace/             # 运行产物：state.json / history.jsonl / 输出工程（gitignore）
 ```
@@ -500,6 +501,68 @@ MediaPipe+librosa 真实分析）走通模块一~五全链——LLM 意图解析
 
 ---
 
+## 模块六：反馈与持续修改 `session_feedback`
+
+首轮剪辑完成后的自然语言持续修改闭环（§4.6/§9）。`FeedbackSession` 是
+会话编排层，不写新的剪辑语义——把"反馈 → IntentPatch → 局部重规划 →
+素材重解析 → Executor Diff"串起来，维护 turn 级会话状态与 Undo/Redo：
+
+```text
+start:  analyze_video → parse(initial) → 增量查询 → plan
+        → resolve_assets → materialize → apply → 落盘三件套
+reply:  meta 拦截 → bridge 视图 → parse(patch) → patch_flow 归一化
+        → apply_patch(intent) → replan → 增量素材 → materialize → apply
+undo:   快照三件套 + apply(旧 resolved) —— diff 自动反向，revision 前进
+```
+
+- **meta 命令拦截**（在 parser 之前）：撤销/重做成会话命令；"换一个"
+  走 fast-path——`switch_alternative` 从 Binding 候选池直接切换，不重搜；
+  "换成椰子树"（有新描述）不拦截，走正常 parse。
+- **bridge 引用解析**：EditView → SemanticProjectView，id 用
+  `source_plan_item_uid` 精确命中 planner by_uid，`event_ref` 回查事件
+  绑定需求——"把爱心删掉"删整绑定，"把第二个爱心删掉"只删单实例。
+- **patch_flow 归一化**（先翻译再 apply_patch，intent 是真相源）：
+  replace→update 单例坍塌（音乐 replace 不改 plan_item_uid）、歧义删除
+  坍塌、实例删除翻译为 remove op（replan 不复活）、unresolved op 剔除。
+- **Undo/Redo git-revert 式**：每次成功 apply 前快照
+  {intent, plan, resolved}；undo 重放旧 resolved plan，executor diff
+  自动产生反向操作，revision 单调递增；`start` 不入栈。
+- **会话状态**：`workspace/<pid>/session/`（session_state.json +
+  intent/ + plan/ + resolved_plan.json + turns.jsonl + snapshots/），
+  跨进程恢复直接接管；`queries_seen` 累积保证 replan 不误判
+  not_analyzed。
+
+```powershell
+session-feedback start -w ws -p p1 --video v.mp4 -u "每次比心时出现粉色爱心"
+session-feedback reply -w ws -p p1 -u "把第二个爱心删掉"
+session-feedback undo -w ws -p p1 && session-feedback state -w ws -p p1
+```
+
+```python
+from session_feedback import FeedbackSession
+
+session = FeedbackSession("workspace", "p1")   # 自动装配五个上游模块
+session.start("video.mp4", "每次比心时出现粉色爱心")
+session.reply("音乐换一个")                     # switched：候选池切换
+session.undo()                                 # undone：revision 前进式回退
+```
+
+真实视频端到端实测（超算 Slurm job 63429503，2026-10）：`test_video.mp4`
+（32.5s 手势舞，MediaPipe+librosa 真实分析，INTENT/PLANNER LLM 在线）
+走通模块一~六全链——`start` 检出比心事件并绑定爱心贴纸+音乐（rev_0001）
+→ `reply("把第二个爱心删掉")` 实例级删除（rev_0002，remove op 沉淀 intent）
+→ `reply("音乐换一个")` meta fast-path 候选池切换，`replace_media` 提交
+rev_0003（asset_uid 变更、对象 uid 不变）→ `reply("每次挥手加星星")`
+触发模块二增量查询（queries_seen 1→2，视频无挥手诚实产空）
+→ `undo` 前进式回滚（redo 栈留痕）。冒烟脚本在超算
+`it_stu100_home/e2e_session_feedback.py`，产物在
+`workspace/e2e_session2/`。注意：LLM 意图抽取会把"视频结尾加上谢谢观看"
+从三分句中丢掉（模块一抽取质量，非编排问题）；user provider 检索吃
+canonical_terms——导入素材 tags 需覆盖 LLM StyleSpec 产出的英文风格词
+（如 upbeat），否则 score=0 被过滤。
+
+---
+
 ## 测试
 
 ```powershell
@@ -542,6 +605,14 @@ replace_music 兜底、Diff（CREATE/UPDATE/DELETE/NOOP、replace_media
 completed_noop、崩溃恢复（中败隔离 candidate、重试复用 revision）、
 Preflight 各拒绝态、dry_run 零副作用、EditView 字段、跨重启状态一致、
 CLI 往返。
+
+覆盖（模块六，`tests/feedback/`）：start 首轮全链落盘、实例级缩放、
+音乐 replace→update 归一化（uid 稳定）、"换一个"候选池切换
+（asset_uid 变 uid 不变）、单绑定歧义坍塌全删、实例删除不复活、
+新需求触发 VU 增量查询、undo/redo/nothing + revision 单调、
+新编辑清 redo、真歧义 needs_clarification 且 intent 不动、
+dry_run 预览零副作用、跨进程会话恢复、CLI 往返
+（FakeVU + 本地库 + MemoryBackend，全程无 CV/LLM）。
 
 新增模块的测试放在 `tests/<模块短名>/` 下（如 `tests/video/`），
 各目录内测试文件 basename 需全局唯一（pytest prepend 导入模式要求）。

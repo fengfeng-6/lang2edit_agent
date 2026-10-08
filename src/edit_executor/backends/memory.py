@@ -263,7 +263,10 @@ class MemoryBackend(ExecutorBackend):
         elif t == EditOpType.delete_object.value:
             sim["objects"].pop(op.target_uid, None)
         elif t == EditOpType.replace_media.value:
-            self._mutate(sim, op, {"media_ref": args.get("media_ref")})
+            updates = {"media_ref": args.get("media_ref")}
+            if "asset_uid" in args:
+                updates["asset_uid"] = args["asset_uid"]
+            self._mutate(sim, op, updates)
         elif t == EditOpType.set_time_range.value:
             self._mutate(
                 sim,

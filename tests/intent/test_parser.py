@@ -239,7 +239,10 @@ def test_openai_compatible_adapter_uses_standard_environment_and_json_mode(monke
     assert adapter is not None
     result = adapter.extract(IntentParserInput(user_utterance="测试"), RequestType.initial_edit)
 
-    assert result == {"event_bound_requirements": []}
+    # 返回值经白名单清洗并包进 editing_intent
+    intent = result["editing_intent"]
+    assert intent["event_bound_requirements"] == []
+    assert intent["object_requirements"] == []
     assert captured["url"] == "https://models.sjtu.edu.cn/api/v1/chat/completions"
     assert captured["authorization"] == "Bearer unit-test-key"
     assert captured["payload"]["model"] == "unit-test-model"
@@ -302,7 +305,7 @@ def test_deepseek_reasoner_payload_omits_temperature_and_accepts_fenced_json(mon
     adapter = OpenAICompatibleExtractor.from_environment()
     assert adapter is not None
     result = adapter.extract(IntentParserInput(user_utterance="测试"), RequestType.initial_edit)
-    assert result == {"event_bound_requirements": []}
+    assert result["editing_intent"]["event_bound_requirements"] == []
     assert "temperature" not in captured["payload"]
 
 

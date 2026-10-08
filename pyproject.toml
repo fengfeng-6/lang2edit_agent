@@ -34,6 +34,7 @@ video-understand = "video_understanding.cli:main"
 editing-planner = "editing_planner.cli:main"
 asset-manager = "asset_manager.cli:main"
 edit-executor = "edit_executor.cli:main"
+session-feedback = "session_feedback.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
