@@ -547,6 +547,20 @@ session.reply("音乐换一个")                     # switched：候选池切�
 session.undo()                                 # undone：revision 前进式回退
 ```
 
+真实视频端到端实测（超算 Slurm job 63429503，2026-10）：`test_video.mp4`
+（32.5s 手势舞，MediaPipe+librosa 真实分析，INTENT/PLANNER LLM 在线）
+走通模块一~六全链——`start` 检出比心事件并绑定爱心贴纸+音乐（rev_0001）
+→ `reply("把第二个爱心删掉")` 实例级删除（rev_0002，remove op 沉淀 intent）
+→ `reply("音乐换一个")` meta fast-path 候选池切换，`replace_media` 提交
+rev_0003（asset_uid 变更、对象 uid 不变）→ `reply("每次挥手加星星")`
+触发模块二增量查询（queries_seen 1→2，视频无挥手诚实产空）
+→ `undo` 前进式回滚（redo 栈留痕）。冒烟脚本在超算
+`it_stu100_home/e2e_session_feedback.py`，产物在
+`workspace/e2e_session2/`。注意：LLM 意图抽取会把"视频结尾加上谢谢观看"
+从三分句中丢掉（模块一抽取质量，非编排问题）；user provider 检索吃
+canonical_terms——导入素材 tags 需覆盖 LLM StyleSpec 产出的英文风格词
+（如 upbeat），否则 score=0 被过滤。
+
 ---
 
 ## 测试
