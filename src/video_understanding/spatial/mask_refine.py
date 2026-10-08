@@ -125,12 +125,15 @@ def _core_seed(core: np.ndarray, peer_frac: float = 0.2,
     return keep
 
 
-def _big_holes(holes: np.ndarray, min_radius: int) -> np.ndarray:
-    """holes 中"半径"≥ min_radius 的成分:先腐蚀剩核再限域回长。"""
-    cores = _erode(holes, min_radius, min_radius)
-    if not cores.any():
-        return np.zeros_like(holes)
-    return _grow(cores, holes)
+def _ccs(m: np.ndarray) -> Iterable[np.ndarray]:
+    """逐块产出 bool mask 的 4-连通成分(无标签实现,工作分辨率下足够快)。"""
+    rest = m.copy()
+    while rest.any():
+        seed = np.zeros_like(m)
+        seed.flat[np.argmax(rest)] = True
+        cc = _grow(seed, rest)
+        yield cc
+        rest &= ~cc
 
 
 def _enclosed(sel: np.ndarray) -> np.ndarray:
@@ -213,13 +216,15 @@ def subject_alpha(
       连通的选择——椅带弱响应带进画面边缘的孤立岛、口袋里的高置信
       渗色岛都被丢弃;轮椅则与人体经座位连续相连得以保留。
     - 形态学:小闭运算 + 椅带横向大闭运算补轮辐间隙。
-    - **口袋抑制**:``_enclosed`` 判出的四向封闭区中,含大洞
-      (≥``pocket_frac`` 帧面积)的封闭域视为"口袋"(手臂-轮之间
-      的空隙,实测 ~2% 帧)。口袋内的带阈扩展全部撤销——deeplab
-      置信会渗入口袋内的柜体/墙面形成鬼影。洞内强响应
-      (≥``pocket_wall``)像素不动,椅把等实体不受影响。
-    - 洞填补:封闭小洞(半径折算 < ``hole_area_frac``)填补,
-      衣服漏检斑、轮辐小空隙被抹平;口袋与中等空隙保持开放。
+    - **口袋抑制**:``_enclosed`` 判出的四向封闭区中,面积
+      ≥``pocket_frac`` 帧面积的洞视为"口袋"内部(手臂-轮之间
+      的空隙,实测 ~2% 帧)。口袋域 = 洞向封闭区内非强响应
+      (<``pocket_wall``)内壁洪泛扩张;域内选区全部撤销——deeplab
+      置信会渗入口袋内的柜体/墙面形成鬼影。强响应墙(手臂/椅把)
+      不属于口袋,选区自然保留。
+    - 洞填补:封闭小洞(面积 < ``hole_area_frac``)填补,
+      衣服漏检斑、轮辐小空隙被抹平;中等空隙与口袋保持开放
+      (轮间缝隙透出新背景是预期效果)。
     - **sel 权威化**:最终 alpha 在选区内为 ``max(fg, band_boost)``
       (低置信召回抬升),选区外裁剪到 ``stray_cap``——任何未入选的
       高置信残岛/渗色一律压成背景,而不是透传 raw conf。
@@ -263,18 +268,21 @@ def subject_alpha(
 
     enc = _enclosed(sel)
     holes = enc & ~sel
-    pocket = np.zeros_like(sel)
     if holes.any():
-        rb = max(1, int(np.sqrt(pocket_frac * h * w / np.pi)))
-        ro = max(1, int(np.sqrt(hole_area_frac * h * w / np.pi)))
-        big = _big_holes(holes, rb)
-        if big.any():
-            # 口袋区 = 大洞 + 封闭域内非强响应( <pocket_wall )内壁;
-            # 强响应墙(手臂/椅把)不属于口袋,选区自然保留
-            wall = fg >= pocket_wall
-            pocket = _grow(big, enc & ~wall)
-            sel &= ~pocket
-        fill = holes & ~pocket & ~_big_holes(holes, ro)
+        pocket_min = pocket_frac * h * w     # 面积门控(实测口袋洞 ~2% 帧)
+        fill_max = hole_area_frac * h * w
+        pocket = np.zeros_like(sel)
+        fill = np.zeros_like(sel)
+        wall = fg >= pocket_wall
+        for cc in _ccs(holes):
+            sz = int(cc.sum())
+            if sz >= pocket_min:
+                # 大洞 → 口袋域:洞 + 封闭区内非强响应内壁
+                pocket |= _grow(cc, enc & ~wall)
+            elif sz < fill_max:
+                fill |= cc                    # 小洞照填
+            # 中间尺寸洞保持开放(轮间空隙透出新背景是预期效果)
+        sel &= ~pocket
         sel |= fill
         sel = _keep_connected(sel, seed)      # 撤销可能切出新孤岛
 
