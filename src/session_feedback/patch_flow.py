@@ -60,15 +60,14 @@ def _collapse_replace(
 ) -> None:
     keep = []
     for req in patch.add_object_requirements:
-        existing = (
+        existing = next(
+            (r for r in intent.object_requirements
+             if r.object_type == req.object_type),
+            None,
+        ) if (
             req.object_type.value in _SINGLETON_TYPES
             and req.action == ObjectAction.replace
-            and next(
-                (r for r in intent.object_requirements
-                 if r.object_type == req.object_type),
-                None,
-            )
-        )
+        ) else None
         if existing is None:
             keep.append(req)
             continue

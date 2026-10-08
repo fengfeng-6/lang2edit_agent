@@ -388,3 +388,37 @@ def test_cli_roundtrip(tmp_path, monkeypatch, capsys):
 
     rc, out = run("undo", "--workspace", ws, "--project", "p1")
     assert rc == 0 and out["status"] == "undone"
+
+
+# ---------------------------------------------------------------------------
+# patch_flow 归一化单元回归
+# ---------------------------------------------------------------------------
+
+
+def test_collapse_replace_skips_non_replace_adds():
+    """action=add 或非单例类型的 add_object_requirements 不进 replace→update
+    坍塌——and 短路链曾把 False 当 existing 用导致 AttributeError。"""
+    from gesture_intent.models import (
+        EditingIntent,
+        IntentPatch,
+        ObjectAction,
+        ObjectRequirement,
+        ObjectType,
+    )
+    from session_feedback.patch_flow import normalize_patch
+
+    patch = IntentPatch(add_object_requirements=[
+        ObjectRequirement(
+            id="obj_req_01", object_type=ObjectType.background,
+            action=ObjectAction.add, source_text="海边沙滩背景"),
+        ObjectRequirement(
+            id="obj_req_02", object_type=ObjectType.sticker,
+            action=ObjectAction.replace, source_text="贴纸"),
+    ])
+
+    out, unresolved, notes = normalize_patch(patch, [], EditingIntent())
+
+    assert [r.id for r in out.add_object_requirements] == [
+        "obj_req_01", "obj_req_02"]
+    assert not out.update_object_requirements
+    assert not notes
