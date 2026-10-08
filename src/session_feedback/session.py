@@ -108,6 +108,11 @@ class FeedbackSession:
             analysis = self.vu.analyze_video(video)
             state.video_id = getattr(analysis.video, "video_id", "") or ""
             state.source_uri = source_uri or _source_uri_of(video, analysis)
+            if self.accessibility_profile is None:
+                # analyze 后 VU 推断的 subject_profile（坐姿/低幅度）默认进 planner
+                self.accessibility_profile = getattr(
+                    getattr(self.vu, "state", None), "subject_profile", None
+                )
             output = self.parser.parse(IntentParserInput(user_utterance=utterance))
             intent = output.editing_intent or EditingIntent()
             self._absorb_queries(state, output.required_video_queries)
