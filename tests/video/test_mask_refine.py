@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""mask_refine 单测：椅带低阈扩展 / 洞填补 / 引导滤波上采样。"""
+"""mask_refine 单测：椅带低阈扩展 / 连通域过滤 / 洞门控 / 引导滤波上采样。
+
+测试用 100x80 合成图 + work_scale=4(工作分辨率 25x20)。
+"""
 import numpy as np
 import pytest
 
-from video_understanding.spatial import mask_refine
 from video_understanding.spatial.mask_refine import (
     guided_upsample,
     subject_alpha,
@@ -23,18 +25,22 @@ class TestSubjectAlpha:
         assert a[25, 40] == pytest.approx(0.9)
         assert a[90, 10] == 0.0
 
-    def test_band_low_threshold_recovers_weak_wheel(self):
+    def test_band_low_threshold_recovers_wheel(self):
         conf = _conf()
         conf[10:58, 30:50] = 0.9          # 人体核心
-        conf[70:99, 5:20] = 0.25          # 椅带内弱响应(左轮)
-        conf[70:99, 65:79] = 0.25         # 椅带内弱响应(右轮)
-        conf[10:30, 65:79] = 0.25         # 带外弱响应(背景杂物,不应入)
+        conf[58:99, 30:50] = 0.3          # 腿(椅带内弱响应,连 core)
+        conf[60:70, 10:70] = 0.3          # 座面横梁(连通腿与轮)
+        conf[70:99, 10:25] = 0.25         # 左轮
+        conf[70:99, 65:79] = 0.25         # 右轮
+        conf[10:30, 65:79] = 0.25         # 带外弱响应(背景杂物)
+        conf[60:70, 0:2] = 0.3            # 椅带内孤立岛(不相连,应丢弃)
         a = subject_alpha(conf, seat_frac=0.58, core_thresh=0.45,
                           band_thresh=0.15, band_boost=0.92)
-        assert a[80, 10] >= 0.9           # 左轮召回
+        assert a[80, 15] >= 0.9           # 左轮召回
         assert a[80, 70] >= 0.9           # 右轮召回
         assert a[20, 70] < 0.5            # 带外低置信不抬升
         assert a[20, 70] == pytest.approx(0.25)
+        assert a[65, 1] < 0.5             # 孤立岛被连通域过滤丢弃
 
     def test_aux_channels_merged_with_gain(self):
         conf = _conf()
@@ -51,23 +57,25 @@ class TestSubjectAlpha:
         a = subject_alpha(conf, seat_frac=0.58)
         assert a[75, 50] >= 0.9           # 封闭小洞被填
 
-    def test_unenclosed_gap_kept(self):
-        # 模拟"腋窝空隙":左侧竖条+底边横条形成开口向右的口袋
+    def test_big_pocket_kept(self):
+        # U 形椅区围出大口袋(类比手臂-轮间空隙,实测 ~2% 帧)
+        # work res(25x20):四壁 sel,内部 4x10 空腔
         conf = _conf((100, 100))
-        conf[10:58, 30:50] = 0.9          # 人体核心(带外部分)
-        conf[58:70, 30:50] = 0.9          # 伸进椅带
-        a = subject_alpha(conf, seat_frac=0.58)
-        assert a[80, 75] < 0.5            # 开口区域不被误填
-        assert a[65, 10] < 0.5            # 椅带内空白边角不填
+        conf[10:56, 30:50] = 0.9          # 人体 core(连到椅带顶壁)
+        conf[56:64, 8:76] = 0.9           # 顶壁
+        conf[56:96, 8:20] = 0.9           # 左壁
+        conf[56:96, 64:76] = 0.9          # 右壁
+        conf[88:96, 8:76] = 0.9           # 底壁
+        a = subject_alpha(conf, seat_frac=0.58, band_hole_frac=0.012)
+        assert a[76, 40] < 0.5            # 大口袋中心保留为背景
+        assert a[60, 40] >= 0.9           # 顶壁照常入选
 
     def test_small_hole_outside_band_filled(self):
-        if mask_refine._ndi is None:
-            pytest.skip("scipy 不可用,跳过带外洞面积门控")
         conf = _conf((100, 100))
         conf[10:50, 20:60] = 0.8          # 核心块(带外)
-        conf[30, 40] = 0.0                # 单像素洞
-        a = subject_alpha(conf, seat_frac=0.58)
-        assert a[30, 40] == pytest.approx(0.8)  # 核心内小洞填成原值
+        conf[24:32, 38:46] = 0.0          # 8x8 洞(work res 2x2)
+        a = subject_alpha(conf, seat_frac=0.58, hole_area_frac=0.004)
+        assert a[28, 42] >= 0.9           # 带外小洞被填
 
     def test_seat_row_explicit(self):
         conf = _conf()
@@ -100,7 +108,6 @@ class TestGuidedUpsample:
         out = guided_upsample(g, a, radius=6, eps=0.005,
                             lo=0.4, hi=0.6, blur_sigma=0)
         row = out[50]
-        # 过渡带宽:从 >0.9 到 <0.1 的跨度
         hi_idx = np.where(row > 0.9)[0]
         lo_idx = np.where(row < 0.1)[0]
         width = lo_idx[lo_idx > hi_idx.max()][0] - hi_idx.max()

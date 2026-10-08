@@ -10,8 +10,9 @@
   ``guided_upsample`` 以原图灰度为引导做引导滤波上采样,把 alpha 边缘
   对齐到真实色彩边缘,再经窄带 remap + 轻羽化得到干净软边。
 
-仅依赖 numpy(PIL 用于可选的原图引导灰度化);``scipy.ndimage`` 若可用
-则顺带做带外小洞按面积填补,不可用自动跳过——集群与 CI 均有 scipy。
+纯 numpy 实现(无 scipy/cv2 依赖),选择/形态学/连通域/洞填补统一在
+``work_scale`` 缩减分辨率上进行(默认 1/4),阈值参数按工作分辨率像素计;
+选中区上采样回原尺寸后只做 alpha 抬升,细节由原置信与引导滤波决定。
 """
 
 from __future__ import annotations
@@ -19,11 +20,6 @@ from __future__ import annotations
 from typing import Iterable, Optional, Tuple
 
 import numpy as np
-
-try:  # 可选:仅用于带外小洞的面积门控
-    from scipy import ndimage as _ndi
-except Exception:  # pragma: no cover - 本地精简环境
-    _ndi = None
 
 # DeepLab-V3(Pascal VOC 21 类)中与轮椅部件相关的辅助类下标。
 DEEPLAB_VOC_CLASSES = {
@@ -81,17 +77,63 @@ def _close(m: np.ndarray, ry: int, rx: int) -> np.ndarray:
     return _erode(_dilate(m, ry, rx), ry, rx)
 
 
+def _grow(cores: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """从核出发在 mask 内迭代膨胀至收敛(连通域提取,无标签实现)。"""
+    grown = cores & mask
+    while True:
+        new = _dilate(grown, 1, 1) & mask
+        if (new == grown).all():
+            return grown
+        grown = new
+
+
+def _keep_connected(sel: np.ndarray, seed: np.ndarray) -> np.ndarray:
+    """保留与 seed 连通的成分(从 seed 洪泛);隔离岛丢弃。
+
+    椅带内低阈扩展会带进不相关的弱响应孤岛(如画面边缘的柜体),
+    而轮椅响应与人体 core 经座位区连续相连——洪泛过滤正好去芜存菁。
+    """
+    if not seed.any():
+        return sel
+    return _grow(seed, sel)
+
+
+def _big_holes(holes: np.ndarray, min_radius: int) -> np.ndarray:
+    """holes 中"半径"≥ min_radius 的成分:先腐蚀剩核再限域回长。"""
+    cores = _erode(holes, min_radius, min_radius)
+    if not cores.any():
+        return np.zeros_like(holes)
+    return _grow(cores, holes)
+
+
 def _enclosed(sel: np.ndarray) -> np.ndarray:
     """四向均被前景包围的像素(行列双向 accumulate 的交集)。
 
-    腋窝、腿缝这类与外边连通的空隙不会被判为洞;轮辐间隙、被前景
-    封闭的口袋会。
+    腋窝、腿缝、手臂-轮间口袋这类与外边连通或开口的结构不会被判为
+    洞;轮辐间隙、被前景四向封闭的空隙会。
     """
     up = np.maximum.accumulate(sel, axis=0)
     down = np.maximum.accumulate(sel[::-1], axis=0)[::-1]
     left = np.maximum.accumulate(sel, axis=1)
     right = np.maximum.accumulate(sel[:, ::-1], axis=1)[:, ::-1]
     return up & down & left & right
+
+
+def _maxpool(a: np.ndarray, s: int) -> np.ndarray:
+    """s×s 最大池化下采样(保留细的弱响应,利于椅带召回)。"""
+    if s <= 1:
+        return a.astype(np.float32)
+    H, W = a.shape
+    h, w = H // s, W // s
+    return (a[: h * s, : w * s].reshape(h, s, w, s)
+            .max(axis=(1, 3))).astype(np.float32)
+
+
+def _nn_upsample(m: np.ndarray, h: int, w: int) -> np.ndarray:
+    """最近邻放大 bool 图到 (h,w)(下采样裁剪区保持 False)。"""
+    ys = np.minimum((np.arange(h) * m.shape[0]) // h, m.shape[0] - 1)
+    xs = np.minimum((np.arange(w) * m.shape[1]) // w, m.shape[1] - 1)
+    return m[ys][:, xs]
 
 
 def _resize_bilinear(a: np.ndarray, h: int, w: int) -> np.ndarray:
@@ -125,64 +167,77 @@ def subject_alpha(
     band_thresh: float = 0.15,
     band_boost: float = 0.92,
     hole_area_frac: float = 0.004,
-    close_px: int = 3,
+    band_hole_frac: float = 0.012,
+    close_px: int = 1,
     band_close_px: Optional[int] = None,
+    work_scale: int = 4,
 ) -> np.ndarray:
     """置信图 → 前景 alpha(与输入同尺寸,float32 in [0,1])。
 
     - ``fg = max(person_conf, aux_gain * max(aux_confs))``:deeplab 的
-      person 通道在轮椅区域已有 0.2~0.6 的弱响应,chair/bicycle 等类
+      person 通道在轮椅区域已有 0.2~0.6 弱响应,chair/bicycle 等类
       折扣后并入召回。
     - 核心阈 ``core_thresh`` 选出确定前景;椅带(``seat_row`` 以下,
-      默认 0.58H——实测轮椅轮顶约在 0.6H、髋关节约 0.8H)内把阈值降到
-      ``band_thresh`` 召回轮子/脚踏等弱响应;带外保持高阈防止抓取
-      背景杂物。
-    - 形态学:基础闭运算 + 椅带内横向大闭运算补轮辐间隙;椅带内
-      四向封闭区域(轮间空隙)直接填;带外小洞(< ``hole_area_frac``
-      帧面积)在 scipy 可用时按连通域填补,否则跳过。
-    - 非核心的入选像素抬到 ``band_boost``,核心像素保留原置信
+      默认 0.58H——实测轮椅轮顶约 0.6H、髋关节约 0.8H)内阈值降到
+      ``band_thresh`` 召回轮子/脚踏;带外保持高阈防抓背景。
+    - 连通域过滤:仅保留与核心连通的选择(椅带弱响应可能带进画面
+      边缘的孤立岛,轮椅则与人体经座位连续相连)。
+    - 形态学:小闭运算 + 椅带横向大闭运算补轮辐间隙。
+    - 洞填补:四向封闭的空隙按半径门控——椅带内允许更大洞
+      (``band_hole_frac``,轮间空隙)而带外仅小洞(``hole_area_frac``,
+      衣服漏检斑);手臂-轮之间的大口袋(实测 ~2% 帧)保持背景,
+      不会把原房间一角误判成前景。
+    - 非核心入选像素抬到 ``band_boost``,核心像素保留原置信
       (头发等软边不被压平)。
+
+    形态学像素参数(``close_px``/``band_close_px``)与洞半径按
+    ``work_scale`` 缩减分辨率计(默认 1/4)。
     """
-    fg = np.asarray(person_conf, dtype=np.float32)
-    if fg.ndim != 2:
-        raise ValueError(f"person_conf 应为 (H,W),got {fg.shape}")
-    fg = fg.copy()
+    fg_full = np.asarray(person_conf, dtype=np.float32)
+    if fg_full.ndim != 2:
+        raise ValueError(f"person_conf 应为 (H,W),got {fg_full.shape}")
+    fg_full = fg_full.copy()
     for a in aux_confs or ():
         a = np.asarray(a, dtype=np.float32)
-        if a.shape != fg.shape:
+        if a.shape != fg_full.shape:
             raise ValueError(
-                f"aux_conf 尺寸 {a.shape} 与 person_conf {fg.shape} 不一致")
-        np.maximum(fg, a * aux_gain, out=fg)
+                f"aux_conf 尺寸 {a.shape} 与 person_conf {fg_full.shape} 不一致")
+        np.maximum(fg_full, a * aux_gain, out=fg_full)
 
-    H, W = fg.shape
-    seat = seat_row if seat_row is not None else int(round(H * seat_frac))
-    seat = max(0, min(seat, H))
-    band = np.zeros((H, W), dtype=bool)
+    H, W = fg_full.shape
+    s = max(1, int(work_scale))
+    fg = _maxpool(fg_full, s) if s > 1 else fg_full
+    h, w = fg.shape
+
+    seat_full = (seat_row if seat_row is not None
+                 else int(round(H * seat_frac)))
+    seat = max(0, min(int(round(seat_full / s)), h))
+    band = np.zeros((h, w), dtype=bool)
     band[seat:, :] = True
 
     core = fg >= core_thresh
     sel = core | ((fg >= band_thresh) & band)
+    sel = _keep_connected(sel, core)
 
     if close_px > 0:
-        r = max(1, close_px // 2)
-        sel = _close(sel, r, r)
-    bw = band_close_px if band_close_px is not None else max(8, W // 40)
-    if bw > 0 and seat < H:
+        sel = _close(sel, close_px, close_px)
+    bw = band_close_px if band_close_px is not None else max(2, w // 40)
+    if bw > 0 and seat < h:
         sel = sel | _close(sel & band, 1, bw)
 
-    enc = _enclosed(sel)
-    sel |= enc & band & ~sel          # 椅带内封闭空隙全填
-    holes = enc & ~band & ~sel        # 带外洞:scipy 时按面积门控
-    if holes.any() and _ndi is not None:
-        lab, n = _ndi.label(holes)
-        if n:
-            sizes = np.bincount(lab.ravel(), minlength=n + 1)
-            small = sizes <= max(1, int(hole_area_frac * H * W))
-            small[0] = False
-            sel |= small[lab]
+    holes = _enclosed(sel) & ~sel
+    if holes.any():
+        rb = max(1, int(np.sqrt(band_hole_frac * h * w / np.pi)))
+        ro = max(1, int(np.sqrt(hole_area_frac * h * w / np.pi)))
+        big_any = _big_holes(holes, rb)          # ≥带内半径者整洞保留
+        big_small = _big_holes(holes, ro)        # ≥带外半径者整洞保留
+        sel |= (holes & band & ~big_any) | (holes & ~band & ~big_small)
 
-    boost = (sel & ~core).astype(np.float32) * band_boost
-    return np.maximum(fg, boost)
+    sel_full = _nn_upsample(sel, H, W)
+    # 低阈召回/填补的像素抬到 band_boost;原置信 ≥core_thresh 的像素
+    # 保持原值(头发、运动模糊等软边渐变不被压平)
+    boost = (sel_full & (fg_full < core_thresh)).astype(np.float32) * band_boost
+    return np.maximum(fg_full, boost)
 
 
 # ---------------- 边缘对齐上采样 ----------------
