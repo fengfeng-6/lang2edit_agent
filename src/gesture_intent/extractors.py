@@ -22,6 +22,11 @@ from .canonicalizer import (
     split_clauses,
     tags_for,
 )
+from .llm_sanitize import (
+    GUIDED_SYSTEM_PROMPT,
+    sanitize_intent_payload,
+    sanitize_patch_payload,
+)
 from .models import (
     Autonomy,
     Constraint,
@@ -45,6 +50,7 @@ from .models import (
     RequestType,
     TargetReference,
     model_dump,
+    model_validate,
 )
 
 
@@ -398,11 +404,9 @@ class OpenAICompatibleExtractor:
         return cls(base_url, api_key, model, timeout=timeout)
 
     def extract(self, input: IntentParserInput, request_type: RequestType) -> dict[str, Any]:
-        system = (
-            "你是视频剪辑需求理解器。只提取用户明确表达的意图，不决定素材文件、位置、大小、"
-            "动画参数、dB、BPM或具体时间戳。保留raw，同时提供canonical/tags。必须返回JSON。"
-            "JSON顶层必须包含request_type和editing_intent或intent_patch。"
-        )
+        # json_object 模式不保证结构（qwen 类端点会自造 {raw,canonical,tags}
+        # 形状）——提示词给全字段模板，返回值再过白名单清洗。
+        system = GUIDED_SYSTEM_PROMPT
         response_format = {"type": "json_object"}
         if os.getenv("INTENT_LLM_RESPONSE_FORMAT", "json_object").lower() == "json_schema":
             schema_type = EditingIntent if request_type == RequestType.initial_edit else IntentPatch
@@ -443,7 +447,22 @@ class OpenAICompatibleExtractor:
                 content = content.removeprefix("```").removeprefix("json").strip()
                 if content.endswith("```"):
                     content = content[:-3].strip()
-        return json.loads(content)
+        result = json.loads(content)
+        if request_type == RequestType.initial_edit:
+            payload = (
+                result.get("editing_intent", result)
+                if isinstance(result, dict) else result
+            )
+            cleaned = sanitize_intent_payload(payload)
+            model_validate(EditingIntent, cleaned)
+            return {"request_type": request_type, "editing_intent": cleaned}
+        payload = (
+            result.get("intent_patch", result)
+            if isinstance(result, dict) else result
+        )
+        cleaned = sanitize_patch_payload(payload)
+        model_validate(IntentPatch, cleaned)
+        return {"request_type": request_type, "intent_patch": cleaned}
 
 
 def default_extractor() -> StructuredIntentExtractor:
