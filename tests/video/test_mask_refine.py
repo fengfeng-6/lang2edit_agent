@@ -66,9 +66,33 @@ class TestSubjectAlpha:
         conf[56:96, 8:20] = 0.9           # 左壁
         conf[56:96, 64:76] = 0.9          # 右壁
         conf[88:96, 8:76] = 0.9           # 底壁
-        a = subject_alpha(conf, seat_frac=0.58, band_hole_frac=0.012)
+        a = subject_alpha(conf, seat_frac=0.58, pocket_frac=0.008)
         assert a[76, 40] < 0.5            # 大口袋中心保留为背景
-        assert a[60, 40] >= 0.9           # 顶壁照常入选
+        assert a[60, 40] == pytest.approx(0.9)  # 顶壁照常入选
+
+    def test_pocket_weak_conf_vetoed(self):
+        # 口袋内部存在中等置信渗色(实测 deeplab bleed 0.3~0.9):
+        # 口袋封闭域内的弱响应选区应被整体撤销
+        conf = _conf((100, 100))
+        conf[10:56, 30:50] = 0.9
+        conf[56:64, 8:76] = 0.9           # 四壁(≥pocket_wall)
+        conf[56:96, 8:20] = 0.9
+        conf[56:96, 64:76] = 0.9
+        conf[88:96, 8:76] = 0.9
+        conf[64:70, 30:50] = 0.35         # 口袋内弱响应,与顶壁相邻(连通)
+        a = subject_alpha(conf, seat_frac=0.58, band_thresh=0.15,
+                          pocket_frac=0.008, pocket_wall=0.75)
+        assert a[66, 40] <= 0.31          # 口袋内弱选区被撤销并压帽
+        assert a[60, 40] == pytest.approx(0.9)  # 顶壁仍是前景
+
+    def test_stray_island_capped(self):
+        # 与 core 不连通的高置信岛:过去透传 raw conf 形成漂浮鬼影,
+        # 现在 sel 权威化后应被压到 stray_cap
+        conf = _conf()
+        conf[10:58, 30:50] = 0.9
+        conf[80:90, 60:70] = 0.85         # 椅带内高置信孤岛
+        a = subject_alpha(conf, seat_frac=0.58, stray_cap=0.30)
+        assert a[85, 65] <= 0.31
 
     def test_small_hole_outside_band_filled(self):
         conf = _conf((100, 100))

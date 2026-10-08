@@ -98,6 +98,33 @@ def _keep_connected(sel: np.ndarray, seed: np.ndarray) -> np.ndarray:
     return _grow(seed, sel)
 
 
+def _core_seed(core: np.ndarray, peer_frac: float = 0.2,
+               min_px: int = 64) -> np.ndarray:
+    """连通种子 = 最大核心 CC + 其余 ≥ max(min_px, peer_frac·最大) 的 CC。
+
+    直接拿整个 core 做种子会让口袋里的高置信渗色岛(实测 conf 0.5~0.9,
+    本身也是 ≥core_thresh 的 core)反向洪泛保活;限到大 CC 后孤岛被弃。
+    保留"并列大块"兜底躯干被阈值切成两段的情形(如抬起的手臂单独成团)。
+    """
+    rest = core.copy()
+    ccs = []
+    while rest.any():
+        seed = np.zeros_like(core)
+        seed.flat[np.argmax(rest)] = True
+        cc = _grow(seed, rest)
+        ccs.append(cc)
+        rest &= ~cc
+    if not ccs:
+        return core
+    biggest = max(int(c.sum()) for c in ccs)
+    thresh = max(min_px, peer_frac * biggest)
+    keep = np.zeros_like(core)
+    for cc in ccs:
+        if int(cc.sum()) >= thresh:
+            keep |= cc
+    return keep
+
+
 def _big_holes(holes: np.ndarray, min_radius: int) -> np.ndarray:
     """holes 中"半径"≥ min_radius 的成分:先腐蚀剩核再限域回长。"""
     cores = _erode(holes, min_radius, min_radius)
@@ -167,7 +194,9 @@ def subject_alpha(
     band_thresh: float = 0.15,
     band_boost: float = 0.92,
     hole_area_frac: float = 0.004,
-    band_hole_frac: float = 0.012,
+    pocket_frac: float = 0.008,
+    pocket_wall: float = 0.75,
+    stray_cap: float = 0.30,
     close_px: int = 1,
     band_close_px: Optional[int] = None,
     work_scale: int = 4,
@@ -180,15 +209,21 @@ def subject_alpha(
     - 核心阈 ``core_thresh`` 选出确定前景;椅带(``seat_row`` 以下,
       默认 0.58H——实测轮椅轮顶约 0.6H、髋关节约 0.8H)内阈值降到
       ``band_thresh`` 召回轮子/脚踏;带外保持高阈防抓背景。
-    - 连通域过滤:仅保留与核心连通的选择(椅带弱响应可能带进画面
-      边缘的孤立岛,轮椅则与人体经座位连续相连)。
+    - 连通域过滤:仅保留与大核心块(``_core_seed``,最大 CC + 并列大块)
+      连通的选择——椅带弱响应带进画面边缘的孤立岛、口袋里的高置信
+      渗色岛都被丢弃;轮椅则与人体经座位连续相连得以保留。
     - 形态学:小闭运算 + 椅带横向大闭运算补轮辐间隙。
-    - 洞填补:四向封闭的空隙按半径门控——椅带内允许更大洞
-      (``band_hole_frac``,轮间空隙)而带外仅小洞(``hole_area_frac``,
-      衣服漏检斑);手臂-轮之间的大口袋(实测 ~2% 帧)保持背景,
-      不会把原房间一角误判成前景。
-    - 非核心入选像素抬到 ``band_boost``,核心像素保留原置信
-      (头发等软边不被压平)。
+    - **口袋抑制**:``_enclosed`` 判出的四向封闭区中,含大洞
+      (≥``pocket_frac`` 帧面积)的封闭域视为"口袋"(手臂-轮之间
+      的空隙,实测 ~2% 帧)。口袋内的带阈扩展全部撤销——deeplab
+      置信会渗入口袋内的柜体/墙面形成鬼影。洞内强响应
+      (≥``pocket_wall``)像素不动,椅把等实体不受影响。
+    - 洞填补:封闭小洞(半径折算 < ``hole_area_frac``)填补,
+      衣服漏检斑、轮辐小空隙被抹平;口袋与中等空隙保持开放。
+    - **sel 权威化**:最终 alpha 在选区内为 ``max(fg, band_boost)``
+      (低置信召回抬升),选区外裁剪到 ``stray_cap``——任何未入选的
+      高置信残岛/渗色一律压成背景,而不是透传 raw conf。
+    - 核心像素保留原置信(头发等软边不被压平)。
 
     形态学像素参数(``close_px``/``band_close_px``)与洞半径按
     ``work_scale`` 缩减分辨率计(默认 1/4)。
@@ -216,8 +251,9 @@ def subject_alpha(
     band[seat:, :] = True
 
     core = fg >= core_thresh
+    seed = _core_seed(core)                 # 大核心块,排除高置信渗色孤岛
     sel = core | ((fg >= band_thresh) & band)
-    sel = _keep_connected(sel, core)
+    sel = _keep_connected(sel, seed)
 
     if close_px > 0:
         sel = _close(sel, close_px, close_px)
@@ -225,19 +261,30 @@ def subject_alpha(
     if bw > 0 and seat < h:
         sel = sel | _close(sel & band, 1, bw)
 
-    holes = _enclosed(sel) & ~sel
+    enc = _enclosed(sel)
+    holes = enc & ~sel
+    pocket = np.zeros_like(sel)
     if holes.any():
-        rb = max(1, int(np.sqrt(band_hole_frac * h * w / np.pi)))
+        rb = max(1, int(np.sqrt(pocket_frac * h * w / np.pi)))
         ro = max(1, int(np.sqrt(hole_area_frac * h * w / np.pi)))
-        big_any = _big_holes(holes, rb)          # ≥带内半径者整洞保留
-        big_small = _big_holes(holes, ro)        # ≥带外半径者整洞保留
-        sel |= (holes & band & ~big_any) | (holes & ~band & ~big_small)
+        big = _big_holes(holes, rb)
+        if big.any():
+            # 口袋区 = 大洞 + 封闭域内非强响应( <pocket_wall )内壁;
+            # 强响应墙(手臂/椅把)不属于口袋,选区自然保留
+            wall = fg >= pocket_wall
+            pocket = _grow(big, enc & ~wall)
+            sel &= ~pocket
+        fill = holes & ~pocket & ~_big_holes(holes, ro)
+        sel |= fill
+        sel = _keep_connected(sel, seed)      # 撤销可能切出新孤岛
 
     sel_full = _nn_upsample(sel, H, W)
-    # 低阈召回/填补的像素抬到 band_boost;原置信 ≥core_thresh 的像素
-    # 保持原值(头发、运动模糊等软边渐变不被压平)
-    boost = (sel_full & (fg_full < core_thresh)).astype(np.float32) * band_boost
-    return np.maximum(fg_full, boost)
+    # 选区内:低置信召回抬到 band_boost,原置信 ≥core_thresh 保留原值;
+    # 选区外:压到 stray_cap,杜绝未入选渗色/残岛透出
+    alpha_in = np.maximum(
+        fg_full, (sel_full & (fg_full < core_thresh)) * band_boost)
+    return np.where(sel_full, alpha_in,
+                    np.minimum(fg_full, stray_cap))
 
 
 # ---------------- 边缘对齐上采样 ----------------
