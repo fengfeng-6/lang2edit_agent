@@ -200,6 +200,7 @@ def subject_alpha(
     pocket_frac: float = 0.008,
     pocket_wall: float = 0.75,
     stray_cap: float = 0.30,
+    interior_guard: int = 1,
     close_px: int = 1,
     band_close_px: Optional[int] = None,
     work_scale: int = 4,
@@ -228,6 +229,10 @@ def subject_alpha(
     - **sel 权威化**:最终 alpha 在选区内为 ``max(fg, band_boost)``
       (低置信召回抬升),选区外裁剪到 ``stray_cap``——任何未入选的
       高置信残岛/渗色一律压成背景,而不是透传 raw conf。
+    - **内部保护**:选区向内腐蚀 ``interior_guard`` 个工作像素后的
+      实心区强制 alpha=1——raw conf 在眉眼/衣褶等纹理处的 0.5~0.9
+      凹陷经引导滤波 remap 会放大成背景渗漏,实心主体必须不透。
+      薄壁(椅把/轮圈)被腐蚀掉的部分不受影响,保持原 alpha。
     - 核心像素保留原置信(头发等软边不被压平)。
 
     形态学像素参数(``close_px``/``band_close_px``)与洞半径按
@@ -291,8 +296,16 @@ def subject_alpha(
     # 选区外:压到 stray_cap,杜绝未入选渗色/残岛透出
     alpha_in = np.maximum(
         fg_full, (sel_full & (fg_full < core_thresh)) * band_boost)
-    return np.where(sel_full, alpha_in,
-                    np.minimum(fg_full, stray_cap))
+    alpha = np.where(sel_full, alpha_in,
+                     np.minimum(fg_full, stray_cap))
+    # 实心内部强制不透明:raw conf 在眉眼/衣褶等处有 0.5~0.9 的坑,
+    # 经引导滤波+窄带 remap 会放大成背景渗漏(v3 内部纹理损伤的根因)。
+    # 腐蚀 guard 个工作像素,薄壁(椅把/轮圈边沿)不受影响。
+    if interior_guard > 0:
+        interior = _nn_upsample(
+            _erode(sel, interior_guard, interior_guard), H, W)
+        alpha[interior] = 1.0
+    return alpha
 
 
 # ---------------- 边缘对齐上采样 ----------------
@@ -340,7 +353,7 @@ def guided_upsample(
     corr_g = _box_mean(g * g, k)
     corr_ga = _box_mean(g * a, k)
     var_g = corr_g - mean_g * mean_g
-    cov_ga = corr_ga - mean_a * mean_a
+    cov_ga = corr_ga - mean_g * mean_a
     A = cov_ga / (var_g + eps)
     b = mean_a - A * mean_g
     q = _box_mean(A, k) * g + _box_mean(b, k)

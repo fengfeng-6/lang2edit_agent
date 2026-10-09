@@ -22,7 +22,7 @@ class TestSubjectAlpha:
         conf[10:40, 20:60] = 0.9  # 上半身核心块
         a = subject_alpha(conf)
         assert a.shape == conf.shape
-        assert a[25, 40] == pytest.approx(0.9)
+        assert a[25, 40] == 1.0    # 实心内部强制不透明
         assert a[90, 10] == 0.0
 
     def test_band_low_threshold_recovers_wheel(self):
